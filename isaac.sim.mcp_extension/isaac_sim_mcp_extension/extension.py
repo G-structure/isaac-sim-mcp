@@ -127,7 +127,7 @@ class MCPExtension(omni.ext.IExt):
             print(f"Isaac Sim MCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
-            self.stop()
+            self._stop()
             
     def _stop(self):
         self.running = False
