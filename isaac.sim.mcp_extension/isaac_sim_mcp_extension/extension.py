@@ -393,11 +393,21 @@ class MCPExtension(omni.ext.IExt):
         """Execute a Python script within the Isaac Sim context.
 
         Args:
-            code: The Python script to execute.
+            code: The Python script to execute. Set a variable named
+                  ``result`` to have it returned in the response.
 
         Returns:
-            Dictionary with execution result.
+            Dictionary with execution result, captured stdout/stderr,
+            and the value of ``result`` if set in the script namespace.
         """
+        import io
+        import sys
+        import traceback
+
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+
         try:
             # Create a local namespace
             local_ns = {}
@@ -409,29 +419,41 @@ class MCPExtension(omni.ext.IExt):
             local_ns["UsdGeom"] = UsdGeom
             local_ns["Sdf"] = Sdf
             local_ns["Gf"] = Gf
-            # code = script["code"]
 
-            # Execute the script
-            exec(code, local_ns)
+            # Capture stdout and stderr during execution
+            sys.stdout = stdout_capture
+            sys.stderr = stderr_capture
 
-            # Get the result if any
-            # result = local_ns.get("result", None)
-            result = None
+            try:
+                exec(code, local_ns)
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+
+            # Return the "result" variable if the script set one
+            result = local_ns.get("result", None)
 
             return {
                 "status": "success",
                 "message": "Script executed successfully",
+                "stdout": stdout_capture.getvalue(),
+                "stderr": stderr_capture.getvalue(),
                 "result": result,
             }
         except Exception as e:
-            carb.log_error(f"Error executing script: {e}")
-            import traceback
+            # Restore stdio in case the finally block didn't run
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
+            carb.log_error(f"Error executing script: {e}")
             carb.log_error(traceback.format_exc())
+
             return {
                 "status": "error",
                 "message": str(e),
                 "traceback": traceback.format_exc(),
+                "stdout": stdout_capture.getvalue(),
+                "stderr": stderr_capture.getvalue(),
             }
 
     def get_scene_info(self):
