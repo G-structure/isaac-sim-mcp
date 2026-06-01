@@ -7,9 +7,19 @@ category = "Robotics"
 keywords = ["mcp", "server", "socket", "simulation", "robotics"]
 
 [dependencies]
-"omni.isaac.core" = {}
+# Isaac-specific deps are OPTIONAL and span both naming schemes so the extension
+# loads on Isaac Sim 5.1 (omni.isaac.*) AND 6.0+ (isaacsim.*). Isaac Sim 6.0
+# renamed omni.isaac.core/omni.isaac.ui to isaacsim.core.api/isaacsim.gui.components;
+# a HARD dep on the old names made Kit's solver abort the whole app at startup
+# ("No versions of omni.isaac.core ... (none found)" -> "Exiting app because of
+# dependency solver failure"), so Isaac never rendered and CUA screenshots were
+# black. Runtime code imports only omni.kit.*/omni.usd/omni.graph (omni.isaac.core
+# imports live in examples/, which Kit does not load), so these are safe optional.
 "omni.kit.uiapp" = {}
-"omni.isaac.ui" = {}
+"omni.isaac.core" = { optional = true }
+"omni.isaac.ui" = { optional = true }
+"isaacsim.core.api" = { optional = true }
+"isaacsim.gui.components" = { optional = true }
 
 
 
