@@ -29,7 +29,6 @@ Routes incoming socket commands to handler modules via a registry.
 from __future__ import annotations
 
 import gc
-import os
 import traceback
 from typing import Any, Dict
 
@@ -52,11 +51,6 @@ class MCPExtension(omni.ext.IExt):
         self._registry: Dict[str, Any] = {}
         self._adapter = None
         self._server: SocketServer | None = None
-        self._autosave_elapsed = 0.0
-        self._autosave_interval = 60.0
-        self._workspace_dir = "/data/workspace"
-        self._autosave_enabled = False
-        self._autosave_sub = None
 
     def on_startup(self, ext_id: str) -> None:
         print("trigger  on_startup for: ", ext_id)
@@ -81,70 +75,20 @@ class MCPExtension(omni.ext.IExt):
 
         self._server = SocketServer(host, port, self._execute_command)
         self._server.start()
-        self._start_autosave()
+        # NOTE: workspace stage persistence is owned EXCLUSIVELY by warm_slot_agent
+        # (save_open_stage), which saves the open root layer IN PLACE and coordinates
+        # with the S3 sync daemon. The extension intentionally does NOT autosave: a
+        # second, flattening, fire-and-forget writer on the same open root layer
+        # raced the agent and the sync daemon, dropped sublayers/references on every
+        # flatten, stacked overlapping exports, and swallowed coroutine-body errors.
+        # See issue "two-writers-open-root".
 
     def on_shutdown(self) -> None:
         print("trigger  on_shutdown for: ", self.ext_id)
-        self._stop_autosave(final_save=True)
         if self._server:
             self._server.stop()
         self._registry.clear()
         gc.collect()
-
-    # ── Platform autosave ─────────────────────────────────────────────────────
-
-    def _start_autosave(self) -> None:
-        self._autosave_interval = float(os.environ.get("AUTOSAVE_INTERVAL", "60"))
-        self._workspace_dir = os.environ.get("WORKSPACE_DIR", "/data/workspace")
-        self._autosave_enabled = os.path.isdir(self._workspace_dir)
-
-        if not self._autosave_enabled:
-            carb.log_info(f"[autosave] Disabled (workspace dir {self._workspace_dir} not found)")
-            return
-
-        update_stream = omni.kit.app.get_app().get_update_event_stream()
-        self._autosave_sub = update_stream.create_subscription_to_pop(
-            self._on_autosave_tick,
-            name="autosave",
-        )
-        carb.log_info(
-            f"[autosave] Enabled, interval={self._autosave_interval}s, dir={self._workspace_dir}"
-        )
-
-    def _on_autosave_tick(self, event) -> None:
-        self._autosave_elapsed += event.payload.get("dt", 0.0)
-        if self._autosave_elapsed < self._autosave_interval:
-            return
-        self._autosave_elapsed = 0.0
-        self._export_workspace_stage_async()
-
-    def _export_workspace_stage_async(self) -> None:
-        ctx = omni.usd.get_context()
-        stage = ctx.get_stage()
-        if not stage:
-            return
-        save_path = os.path.join(self._workspace_dir, "scene.usd")
-        try:
-            from omni.kit.async_engine import run_coroutine
-
-            run_coroutine(ctx.export_as_stage_async(save_path))
-            carb.log_info(f"[autosave] Exported stage to {save_path}")
-        except Exception as exc:
-            carb.log_warn(f"[autosave] Failed to export stage: {exc}")
-
-    def _stop_autosave(self, final_save: bool = False) -> None:
-        if self._autosave_sub is not None:
-            self._autosave_sub = None
-        if not final_save or not self._autosave_enabled:
-            return
-        try:
-            ctx = omni.usd.get_context()
-            if ctx.get_stage():
-                save_path = os.path.join(self._workspace_dir, "scene.usd")
-                ctx.get_stage().Export(save_path)
-                carb.log_info(f"[autosave] Final save to {save_path}")
-        except Exception as exc:
-            carb.log_warn(f"[autosave] Final save failed: {exc}")
 
     # ── Legacy command compatibility ──────────────────────────────────────────
 
