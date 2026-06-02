@@ -72,14 +72,28 @@ def test_extension_reads_platform_socket_settings():
     assert "8766" in source
 
 
-def test_platform_autosave_hooks_are_present():
-    source = _extension_source()
-    assert "/data/workspace" in source
-    assert "AUTOSAVE_INTERVAL" in source
-    assert "scene.usd" in source
+def test_extension_does_not_autosave_scene_usd():
+    """Regression guard for the "two-writers-open-root" bug.
 
+    scene.usd is the open ROOT layer and is persisted EXCLUSIVELY by
+    warm_slot_agent.save_open_stage() (an in-place ctx.save_stage() of the open
+    root, throttled and coordinated with the S3 sync daemon). The extension must
+    NOT run its own autosave: a second, flattening, fire-and-forget writer
+    (ctx.export_as_stage_async) on the same open root layer raced the agent and the
+    sync daemon, dropped sublayers/references on every flatten, stacked overlapping
+    exports, and swallowed coroutine-body errors. See issue "two-writers-open-root".
+    """
+    source = _extension_source()
     tree = ast.parse(source)
     methods = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-    assert "_start_autosave" in methods
-    assert "_on_autosave_tick" in methods
-    assert "_stop_autosave" in methods
+
+    # The extension must not flatten/export the stage to disk on a timer.
+    assert "export_as_stage_async" not in source
+    assert "AUTOSAVE_INTERVAL" not in source
+    assert "scene.usd" not in source
+
+    # The old self-owned autosave hooks must stay deleted.
+    assert "_start_autosave" not in methods
+    assert "_on_autosave_tick" not in methods
+    assert "_export_workspace_stage_async" not in methods
+    assert "_stop_autosave" not in methods
