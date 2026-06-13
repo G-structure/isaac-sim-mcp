@@ -60,7 +60,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
     # ── Prims ──────────────────────────────────────────────
 
-    def create_prim(self, prim_path: str, prim_type: str = "Xform", **kwargs) -> Usd.Prim:
+    def create_prim(
+        self, prim_path: str, prim_type: str = "Xform", **kwargs
+    ) -> Usd.Prim:
         from isaacsim.core.utils.prims import create_prim
 
         return create_prim(prim_path, prim_type, **kwargs)
@@ -92,7 +94,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
                     continue
                 # Find USD files at this level
                 for f in files:
-                    if f.relative_path.endswith(".usd") or f.relative_path.endswith(".usda"):
+                    if f.relative_path.endswith(".usd") or f.relative_path.endswith(
+                        ".usda"
+                    ):
                         key = name.lower().replace(" ", "_")
                         if key not in discovered:
                             discovered[key] = {
@@ -107,12 +111,21 @@ class IsaacAdapterV5(IsaacAdapterBase):
                     if r3 != omni.client.Result.OK:
                         continue
                     for sf in subfiles:
-                        if sf.relative_path.endswith(".usd") or sf.relative_path.endswith(".usda"):
+                        if sf.relative_path.endswith(
+                            ".usd"
+                        ) or sf.relative_path.endswith(".usda"):
                             key = f"{name}_{subname}".lower().replace(" ", "_")
                             if key not in discovered:
                                 discovered[key] = {
-                                    "asset_path": base + name + "/" + subname + "/" + sf.relative_path,
-                                    "description": f"{name} {subname}".replace("_", " "),
+                                    "asset_path": base
+                                    + name
+                                    + "/"
+                                    + subname
+                                    + "/"
+                                    + sf.relative_path,
+                                    "description": f"{name} {subname}".replace(
+                                        "_", " "
+                                    ),
                                 }
                             break
         return discovered
@@ -143,11 +156,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
         xformable = UsdGeom.Xformable(prim)
         xformable.ClearXformOpOrder()
         if position is not None:
-            xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*position))
+            xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Vec3d(*position)
+            )
         if rotation is not None:
-            xformable.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*rotation))
+            xformable.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Vec3d(*rotation)
+            )
         if scale is not None:
-            xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*scale))
+            xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Vec3d(*scale)
+            )
 
     def get_prim_transform(self, prim_path: str) -> Dict[str, Any]:
         from pxr import UsdGeom
@@ -163,7 +182,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
             "position": [translation[0], translation[1], translation[2]],
         }
 
-    def list_prims(self, root_path: str = "/", prim_type: Optional[str] = None) -> List[Dict[str, str]]:
+    def list_prims(
+        self, root_path: str = "/", prim_type: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         stage = self.get_stage()
         root = stage.GetPrimAtPath(root_path)
         results: List[Dict[str, str]] = []
@@ -195,7 +216,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 pass
         return info
 
-    def get_prim_actual_size(self, prim_path: str) -> Tuple[List[float], Tuple[List[float], List[float]]]:
+    def get_prim_actual_size(
+        self, prim_path: str
+    ) -> Tuple[List[float], Tuple[List[float], List[float]]]:
         """Return actual dimensions and bounding box for a geometric prim."""
         from pxr import UsdGeom
 
@@ -219,12 +242,20 @@ class IsaacAdapterV5(IsaacAdapterBase):
         if prim_type == "Cube":
             geom = UsdGeom.Cube(prim)
             size_attr = geom.GetSizeAttr()
-            size = float(size_attr.Get()) if size_attr and size_attr.Get() is not None else 1.0
+            size = (
+                float(size_attr.Get())
+                if size_attr and size_attr.Get() is not None
+                else 1.0
+            )
             dims = [size * scale[0], size * scale[1], size * scale[2]]
         elif prim_type == "Sphere":
             geom = UsdGeom.Sphere(prim)
             radius_attr = geom.GetRadiusAttr()
-            radius = float(radius_attr.Get()) if radius_attr and radius_attr.Get() is not None else 0.5
+            radius = (
+                float(radius_attr.Get())
+                if radius_attr and radius_attr.Get() is not None
+                else 0.5
+            )
             diameter = radius * 2.0
             dims = [diameter * scale[0], diameter * scale[1], diameter * scale[2]]
         elif prim_type == "Cylinder":
@@ -232,8 +263,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
             radius_attr = geom.GetRadiusAttr()
             height_attr = geom.GetHeightAttr()
             axis_attr = geom.GetAxisAttr()
-            radius = float(radius_attr.Get()) if radius_attr and radius_attr.Get() is not None else 0.5
-            height = float(height_attr.Get()) if height_attr and height_attr.Get() is not None else 1.0
+            radius = (
+                float(radius_attr.Get())
+                if radius_attr and radius_attr.Get() is not None
+                else 0.5
+            )
+            height = (
+                float(height_attr.Get())
+                if height_attr and height_attr.Get() is not None
+                else 1.0
+            )
             axis = axis_attr.Get() if axis_attr and axis_attr.Get() is not None else "Z"
             diameter = radius * 2.0
             if axis == "X":
@@ -247,8 +286,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
             radius_attr = geom.GetRadiusAttr()
             height_attr = geom.GetHeightAttr()
             axis_attr = geom.GetAxisAttr()
-            radius = float(radius_attr.Get()) if radius_attr and radius_attr.Get() is not None else 0.5
-            height = float(height_attr.Get()) if height_attr and height_attr.Get() is not None else 1.0
+            radius = (
+                float(radius_attr.Get())
+                if radius_attr and radius_attr.Get() is not None
+                else 0.5
+            )
+            height = (
+                float(height_attr.Get())
+                if height_attr and height_attr.Get() is not None
+                else 1.0
+            )
             axis = axis_attr.Get() if axis_attr and axis_attr.Get() is not None else "Z"
             diameter = radius * 2.0
             if axis == "X":
@@ -261,8 +308,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
             geom = UsdGeom.Capsule(prim)
             radius_attr = geom.GetRadiusAttr()
             height_attr = geom.GetHeightAttr()
-            radius = float(radius_attr.Get()) if radius_attr and radius_attr.Get() is not None else 0.5
-            height = float(height_attr.Get()) if height_attr and height_attr.Get() is not None else 1.0
+            radius = (
+                float(radius_attr.Get())
+                if radius_attr and radius_attr.Get() is not None
+                else 0.5
+            )
+            height = (
+                float(height_attr.Get())
+                if height_attr and height_attr.Get() is not None
+                else 1.0
+            )
             total_height = height + 2.0 * radius
             diameter = radius * 2.0
             dims = [diameter * scale[0], diameter * scale[1], total_height * scale[2]]
@@ -325,7 +380,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
                     key = model_name.lower().replace(" ", "_")
                     if key in discovered:
                         # Keep the simpler filename (shorter name wins)
-                        if len(fname) < len(discovered[key]["asset_path"].split("/")[-1]):
+                        if len(fname) < len(
+                            discovered[key]["asset_path"].split("/")[-1]
+                        ):
                             discovered[key]["asset_path"] = asset_rel
                     else:
                         discovered[key] = {
@@ -366,7 +423,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
         root_prim = stage.GetPrimAtPath(prim_path)
         if not joint_names and root_prim.IsValid():
             for desc in Usd.PrimRange(root_prim):
-                if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint):
+                if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                    UsdPhysics.PrismaticJoint
+                ):
                     joint_names.append(desc.GetName())
             num_dof = len(joint_names)
 
@@ -441,7 +500,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
         # Collect all joints under the articulation
         joints = []
         for desc in Usd.PrimRange(root_prim):
-            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint):
+            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                UsdPhysics.PrismaticJoint
+            ):
                 joints.append(desc)
 
         if joint_indices is not None:
@@ -487,9 +548,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
             return []
         names: List[str] = []
         for desc in Usd.PrimRange(root_prim):
-            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint):
+            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                UsdPhysics.PrismaticJoint
+            ):
                 names.append(desc.GetName())
-        self._joint_name_cache[prim_path] = names
+        # Only cache a non-empty result. Caching [] (prim not yet a valid
+        # articulation / no joints authored yet) pinned it forever via the
+        # `cached is not None` guard, so a later delete+recreate or a prim that
+        # becomes articulated never re-resolved (F11).
+        if names:
+            self._joint_name_cache[prim_path] = names
         return names
 
     def get_joint_positions(self, prim_path: str) -> List[float]:
@@ -511,7 +579,10 @@ class IsaacAdapterV5(IsaacAdapterBase):
             return []
         positions_list: List[float] = []
         for desc in Usd.PrimRange(root_prim):
-            if not (desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint)):
+            if not (
+                desc.IsA(UsdPhysics.RevoluteJoint)
+                or desc.IsA(UsdPhysics.PrismaticJoint)
+            ):
                 continue
             is_revolute = desc.IsA(UsdPhysics.RevoluteJoint)
             drive_type = "angular" if is_revolute else "linear"
@@ -569,7 +640,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
         # Walk descendants to find joint prims
         for desc in Usd.PrimRange(prim):
-            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint):
+            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                UsdPhysics.PrismaticJoint
+            ):
                 joint_data: Dict[str, Any] = {"name": desc.GetName()}
 
                 if desc.IsA(UsdPhysics.RevoluteJoint):
@@ -594,10 +667,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
                         stiffness_attr = drive_api.GetStiffnessAttr()
                         damping_attr = drive_api.GetDampingAttr()
                         target_attr = drive_api.GetTargetPositionAttr()
-                        joint_data["stiffness"] = stiffness_attr.Get() if stiffness_attr else None
-                        joint_data["damping"] = damping_attr.Get() if damping_attr else None
+                        joint_data["stiffness"] = (
+                            stiffness_attr.Get() if stiffness_attr else None
+                        )
+                        joint_data["damping"] = (
+                            damping_attr.Get() if damping_attr else None
+                        )
                         # USD default as fallback
-                        joint_data["target_position"] = target_attr.Get() if target_attr else None
+                        joint_data["target_position"] = (
+                            target_attr.Get() if target_attr else None
+                        )
                         break
 
                 # Match actual position from articulation if possible
@@ -612,8 +691,14 @@ class IsaacAdapterV5(IsaacAdapterBase):
                         joint_data["target_position"] = float(runtime_targets[idx])
 
                     # Calculate position_error using (possibly runtime) target
-                    if joint_data.get("target_position") is not None and "actual_position" in joint_data:
-                        joint_data["position_error"] = joint_data["target_position"] - joint_data["actual_position"]
+                    if (
+                        joint_data.get("target_position") is not None
+                        and "actual_position" in joint_data
+                    ):
+                        joint_data["position_error"] = (
+                            joint_data["target_position"]
+                            - joint_data["actual_position"]
+                        )
 
                 joints_info.append(joint_data)
 
@@ -649,11 +734,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
         return SimulationContext(**kwargs)
 
-    def create_physics_scene(self, gravity: Optional[Sequence[float]] = None, scene_name: str = "PhysicsScene") -> str:
+    def create_physics_scene(
+        self,
+        gravity: Optional[Sequence[float]] = None,
+        scene_name: str = "PhysicsScene",
+    ) -> str:
         import omni.kit.commands
 
         scene_path = f"/World/{scene_name}"
-        omni.kit.commands.execute("CreatePrim", prim_path=scene_path, prim_type="PhysicsScene")
+        omni.kit.commands.execute(
+            "CreatePrim", prim_path=scene_path, prim_type="PhysicsScene"
+        )
         return scene_path
 
     def get_physics_state(self, prim_path: str) -> Dict[str, Any]:
@@ -696,8 +787,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 if rb_data and rb_data.get("ret_val", False):
                     vel = rb_data.get("linear_velocity", (0.0, 0.0, 0.0))
                     ang_vel = rb_data.get("angular_velocity", (0.0, 0.0, 0.0))
-                    result["linear_velocity"] = [float(vel[0]), float(vel[1]), float(vel[2])]
-                    result["angular_velocity"] = [float(ang_vel[0]), float(ang_vel[1]), float(ang_vel[2])]
+                    result["linear_velocity"] = [
+                        float(vel[0]),
+                        float(vel[1]),
+                        float(vel[2]),
+                    ]
+                    result["angular_velocity"] = [
+                        float(ang_vel[0]),
+                        float(ang_vel[1]),
+                        float(ang_vel[2]),
+                    ]
                 else:
                     result["linear_velocity"] = [0.0, 0.0, 0.0]
                     result["angular_velocity"] = [0.0, 0.0, 0.0]
@@ -716,7 +815,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
     # ── Sensors ────────────────────────────────────────────
 
-    def create_camera(self, prim_path: str, resolution: Tuple[int, int] = (1280, 720), **kwargs) -> Any:
+    def create_camera(
+        self, prim_path: str, resolution: Tuple[int, int] = (1280, 720), **kwargs
+    ) -> Any:
         from isaacsim.sensors.camera import Camera
 
         return Camera(prim_path=prim_path, resolution=resolution, **kwargs)
@@ -727,10 +828,14 @@ class IsaacAdapterV5(IsaacAdapterBase):
         cam = Camera(prim_path=prim_path)
         return cam.get_rgba()
 
-    def create_lidar(self, prim_path: str, config: Optional[str] = None, **kwargs) -> Any:
+    def create_lidar(
+        self, prim_path: str, config: Optional[str] = None, **kwargs
+    ) -> Any:
         from isaacsim.sensors.rtx import LidarRtx
 
-        return LidarRtx(prim_path=prim_path, config=config or "Example_Rotary", **kwargs)
+        return LidarRtx(
+            prim_path=prim_path, config=config or "Example_Rotary", **kwargs
+        )
 
     def get_lidar_point_cloud(self, prim_path: str) -> np.ndarray:
         from isaacsim.sensors.rtx import LidarRtx
@@ -756,8 +861,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
         shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
         shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
         if color:
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color[:3]))
-        material.CreateSurfaceOutput().ConnectToSource(shader.CreateOutput("surface", Sdf.ValueTypeNames.Token))
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(*color[:3])
+            )
+        material.CreateSurfaceOutput().ConnectToSource(
+            shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        )
         return material
 
     def create_physics_material(
@@ -807,7 +916,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
         }
         cls = light_classes.get(light_type)
         if not cls:
-            raise ValueError(f"Unknown light type: {light_type}. Options: {list(light_classes.keys())}")
+            raise ValueError(
+                f"Unknown light type: {light_type}. Options: {list(light_classes.keys())}"
+            )
         light = cls.Define(stage, prim_path)
         light.CreateIntensityAttr(intensity)
         if color:
@@ -842,9 +953,13 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def clone_prim(self, source_path: str, target_path: str) -> None:
         import omni.kit.commands
 
-        omni.kit.commands.execute("CopyPrim", path_from=source_path, path_to=target_path)
+        omni.kit.commands.execute(
+            "CopyPrim", path_from=source_path, path_to=target_path
+        )
 
-    def import_urdf(self, urdf_path: str, prim_path: str = "/World/robot", **kwargs) -> Any:
+    def import_urdf(
+        self, urdf_path: str, prim_path: str = "/World/robot", **kwargs
+    ) -> Any:
         import os
 
         if not os.path.isfile(urdf_path):
@@ -854,8 +969,14 @@ class IsaacAdapterV5(IsaacAdapterBase):
         status, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
         if not status or import_config is None:
             raise RuntimeError("URDFCreateImportConfig failed")
-        parse_result = omni.kit.commands.execute("URDFParseFile", urdf_path=urdf_path, import_config=import_config)
-        if isinstance(parse_result, tuple) and parse_result and parse_result[0] is False:
+        parse_result = omni.kit.commands.execute(
+            "URDFParseFile", urdf_path=urdf_path, import_config=import_config
+        )
+        if (
+            isinstance(parse_result, tuple)
+            and parse_result
+            and parse_result[0] is False
+        ):
             raise RuntimeError(f"URDFParseFile failed: {parse_result}")
         result = omni.kit.commands.execute(
             "URDFImportRobot",
@@ -869,7 +990,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
         prim = self.get_stage().GetPrimAtPath(prim_path)
         if not prim.IsValid():
             self.delete_prim(prim_path)
-            raise RuntimeError(f"URDF importer completed but produced no valid prim at {prim_path}: {result}")
+            raise RuntimeError(
+                f"URDF importer completed but produced no valid prim at {prim_path}: {result}"
+            )
         return result
 
     # ── Simulation ─────────────────────────────────────────
@@ -926,35 +1049,48 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
                 timeline = omni.timeline.get_timeline_interface()
                 result["timeline_state"] = (
-                    "playing" if timeline.is_playing() else "stopped" if timeline.is_stopped() else "paused"
+                    "playing"
+                    if timeline.is_playing()
+                    else "stopped"
+                    if timeline.is_stopped()
+                    else "paused"
                 )
             except Exception:
                 result["timeline_state"] = None
 
-        try:
-            proc = subprocess.run(
-                [
+            # nvidia-smi is a ~2s subprocess on Isaac's MAIN thread. The compact path
+            # is the high-frequency health probe (simulation.ping on every save +
+            # readiness + bridge heartbeat); running nvidia-smi there adds repeated
+            # main-thread stalls — the opposite of the #155 goal — so VRAM telemetry
+            # is gathered ONLY for the explicit get_resources call (F5). Also: the
+            # default NVIDIA_VISIBLE_DEVICES="all" is not a valid `-i` selector, so
+            # only pass -i for a numeric index; otherwise query all and take the
+            # first row (F14).
+            try:
+                vis = os.environ.get("NVIDIA_VISIBLE_DEVICES", "").split(",")[0].strip()
+                cmd = [
                     "nvidia-smi",
                     "--query-gpu=memory.free,memory.total",
                     "--format=csv,noheader,nounits",
-                    "-i",
-                    os.environ.get("NVIDIA_VISIBLE_DEVICES", "0").split(",")[0],
-                ],
-                text=True,
-                capture_output=True,
-                timeout=2,
-                check=False,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                free, total = [int(part.strip()) for part in proc.stdout.strip().splitlines()[0].split(",")[:2]]
-                result["vram_free_mb"] = free
-                result["vram_total_mb"] = total
-            else:
+                ]
+                if vis.isdigit():
+                    cmd += ["-i", vis]
+                proc = subprocess.run(
+                    cmd, text=True, capture_output=True, timeout=2, check=False
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    free, total = [
+                        int(part.strip())
+                        for part in proc.stdout.strip().splitlines()[0].split(",")[:2]
+                    ]
+                    result["vram_free_mb"] = free
+                    result["vram_total_mb"] = total
+                else:
+                    result["vram_free_mb"] = None
+                    result["vram_total_mb"] = None
+            except Exception:
                 result["vram_free_mb"] = None
                 result["vram_total_mb"] = None
-        except Exception:
-            result["vram_free_mb"] = None
-            result["vram_total_mb"] = None
 
         return result
 
@@ -969,17 +1105,27 @@ class IsaacAdapterV5(IsaacAdapterBase):
         import omni.kit.app
 
         start = time.monotonic()
-        effective_budget_ms = budget_ms if budget_ms is not None else 8000
+        # Treat budget_ms<=0 (and None) as the default budget — NOT as "unbounded".
+        # A caller passing budget_ms=0 previously disabled the wall-clock guard
+        # entirely, re-opening the exact OOM/main-thread wedge #151 asked to fix.
+        # A hard frame ceiling is a second guard against a runaway num_steps (F2).
+        effective_budget_ms = (
+            budget_ms if (budget_ms is not None and budget_ms > 0) else 8000
+        )
+        max_step_frames = 4000
         stepped = 0
         timed_out = False
-        for _ in range(max(0, num_steps)):
-            if effective_budget_ms > 0 and (time.monotonic() - start) * 1000 >= effective_budget_ms:
+        for _ in range(min(max(0, num_steps), max_step_frames)):
+            if (time.monotonic() - start) * 1000 >= effective_budget_ms:
                 timed_out = True
                 break
             omni.kit.app.get_app().update()
             stepped += 1
 
-        result: Dict[str, Any] = {"stepped": stepped, "resources": self.get_resources(compact=True)}
+        result: Dict[str, Any] = {
+            "stepped": stepped,
+            "resources": self.get_resources(compact=True),
+        }
         if timed_out:
             result["timed_out"] = True
 
@@ -1004,7 +1150,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
                         rb_data = physx.get_rigidbody_transformation(path)
                         if rb_data and rb_data.get("ret_val", False):
                             pos = rb_data["position"]
-                            state["position"] = [float(pos[0]), float(pos[1]), float(pos[2])]
+                            state["position"] = [
+                                float(pos[0]),
+                                float(pos[1]),
+                                float(pos[2]),
+                            ]
                         else:
                             transform = self.get_prim_transform(path)
                             state["position"] = transform.get("position", [0, 0, 0])
@@ -1018,8 +1168,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 if prim.HasAPI(UsdPhysics.RigidBodyAPI):
                     try:
                         physics_state = self.get_physics_state(path)
-                        state["linear_velocity"] = physics_state.get("linear_velocity", [0, 0, 0])
-                        state["angular_velocity"] = physics_state.get("angular_velocity", [0, 0, 0])
+                        state["linear_velocity"] = physics_state.get(
+                            "linear_velocity", [0, 0, 0]
+                        )
+                        state["angular_velocity"] = physics_state.get(
+                            "angular_velocity", [0, 0, 0]
+                        )
                     except Exception:
                         pass
                 prim_states.append(state)
@@ -1031,7 +1185,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
             resources = result.get("resources") or {}
             available_ram_mb = resources.get("available_ram_mb")
             effective_observe_cap = observe_cap
-            if effective_observe_cap is None and isinstance(available_ram_mb, int) and available_ram_mb < 3000:
+            if (
+                effective_observe_cap is None
+                and isinstance(available_ram_mb, int)
+                and available_ram_mb < 3000
+            ):
                 effective_observe_cap = 1
             observed_paths = list(observe_joints)
             skipped_paths: List[str] = []
@@ -1042,14 +1200,19 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 try:
                     positions = self.get_joint_positions(path)
                     names = self._get_joint_names(path)
-                    joints_dict = dict(zip(names, positions)) if names else {"positions": positions}
+                    joints_dict = (
+                        dict(zip(names, positions))
+                        if names
+                        else {"positions": positions}
+                    )
                     joint_states.append({"prim_path": path, "joints": joints_dict})
                 except Exception as e:
                     joint_states.append({"prim_path": path, "error": str(e)})
             result["joint_states"] = joint_states
             if skipped_paths:
                 result["observe_skipped"] = [
-                    {"prim_path": path, "reason": "art_observe_cap"} for path in skipped_paths
+                    {"prim_path": path, "reason": "art_observe_cap"}
+                    for path in skipped_paths
                 ]
 
         return result
@@ -1101,7 +1264,14 @@ class IsaacAdapterV5(IsaacAdapterBase):
         if cwd and cwd not in sys.path:
             sys.path.insert(0, cwd)
 
-        local_ns = {"omni": omni, "carb": carb, "Usd": Usd, "UsdGeom": UsdGeom, "Sdf": Sdf, "Gf": Gf}
+        local_ns = {
+            "omni": omni,
+            "carb": carb,
+            "Usd": Usd,
+            "UsdGeom": UsdGeom,
+            "Sdf": Sdf,
+            "Gf": Gf,
+        }
 
         # Capture stdout/stderr
         old_stdout, old_stderr = sys.stdout, sys.stderr
@@ -1130,7 +1300,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
     # Track exec() namespaces to clean up subscriptions on reload
     _exec_namespaces: Dict[str, dict] = {}
 
-    def reload_script(self, file_path: str, module_name: Optional[str] = None) -> Dict[str, Any]:
+    def reload_script(
+        self, file_path: str, module_name: Optional[str] = None
+    ) -> Dict[str, Any]:
         import importlib
         import io
         import os
@@ -1168,7 +1340,10 @@ class IsaacAdapterV5(IsaacAdapterBase):
             else:
                 # Execute file contents (hot-patch)
                 if not os.path.isfile(file_path):
-                    return {"status": "error", "message": f"File not found: {file_path}"}
+                    return {
+                        "status": "error",
+                        "message": f"File not found: {file_path}",
+                    }
                 with open(file_path, "r") as f:
                     code = f.read()
                 import carb

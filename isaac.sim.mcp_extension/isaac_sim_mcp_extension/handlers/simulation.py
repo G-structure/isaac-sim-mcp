@@ -39,9 +39,15 @@ def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
     registry["simulation.execute_script"] = lambda **p: execute_script(adapter, **p)
     registry["simulation.get_state"] = lambda **p: get_simulation_state(adapter, **p)
     registry["simulation.get_logs"] = lambda **p: get_logs(adapter, **p)
-    registry["simulation.get_physics_state"] = lambda **p: get_physics_state_handler(adapter, **p)
-    registry["simulation.get_joint_config"] = lambda **p: get_joint_config_handler(adapter, **p)
-    registry["simulation.reload_script"] = lambda **p: reload_script_handler(adapter, **p)
+    registry["simulation.get_physics_state"] = lambda **p: get_physics_state_handler(
+        adapter, **p
+    )
+    registry["simulation.get_joint_config"] = lambda **p: get_joint_config_handler(
+        adapter, **p
+    )
+    registry["simulation.reload_script"] = lambda **p: reload_script_handler(
+        adapter, **p
+    )
     registry["simulation.ping"] = lambda **p: ping(adapter, **p)
     registry["simulation.get_resources"] = lambda **p: get_resources(adapter, **p)
 
@@ -86,8 +92,17 @@ def step(
             budget_ms=budget_ms,
             observe_cap=observe_cap,
         )
-        status = "timeout" if result.get("timed_out") else "success"
-        return {"status": status, "message": f"Stepped {result.get('stepped', 0)} frames", **result}
+        # A budget-trip is a graceful PARTIAL result, not a failure. Returning
+        # status="timeout" made _execute_command collapse the whole payload to a
+        # bare error, discarding stepped/joint_states/observe_skipped/resources and
+        # making a capped step indistinguishable from a crash (F1). Keep
+        # status="success" and carry timed_out as a field (mirrors observe_skipped)
+        # so the agent can read the partial telemetry and back off.
+        return {
+            "status": "success",
+            "message": f"Stepped {result.get('stepped', 0)} frames",
+            **result,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -122,7 +137,9 @@ def set_physics(
         return {"status": "error", "message": str(e)}
 
 
-def execute_script(adapter: IsaacAdapterBase, code: Optional[str] = None, cwd: Optional[str] = None) -> Dict[str, Any]:
+def execute_script(
+    adapter: IsaacAdapterBase, code: Optional[str] = None, cwd: Optional[str] = None
+) -> Dict[str, Any]:
     try:
         if not code:
             return {"status": "error", "message": "code is required"}
@@ -140,7 +157,9 @@ def get_simulation_state(adapter: IsaacAdapterBase) -> Dict[str, Any]:
         return {"status": "error", "message": str(e)}
 
 
-def get_physics_state_handler(adapter: IsaacAdapterBase, prim_path: Optional[str] = None) -> Dict[str, Any]:
+def get_physics_state_handler(
+    adapter: IsaacAdapterBase, prim_path: Optional[str] = None
+) -> Dict[str, Any]:
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
@@ -150,7 +169,9 @@ def get_physics_state_handler(adapter: IsaacAdapterBase, prim_path: Optional[str
         return {"status": "error", "message": str(e)}
 
 
-def get_joint_config_handler(adapter: IsaacAdapterBase, prim_path: Optional[str] = None) -> Dict[str, Any]:
+def get_joint_config_handler(
+    adapter: IsaacAdapterBase, prim_path: Optional[str] = None
+) -> Dict[str, Any]:
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
@@ -161,7 +182,9 @@ def get_joint_config_handler(adapter: IsaacAdapterBase, prim_path: Optional[str]
 
 
 def reload_script_handler(
-    adapter: IsaacAdapterBase, file_path: Optional[str] = None, module_name: Optional[str] = None
+    adapter: IsaacAdapterBase,
+    file_path: Optional[str] = None,
+    module_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         if not file_path:
@@ -189,7 +212,18 @@ def _ensure_log_listener():
 
     logger = omni.log.get_log()
 
-    def _on_log(source, level, filename, function_name, module_name, line, message, pid, tid, timestamp):
+    def _on_log(
+        source,
+        level,
+        filename,
+        function_name,
+        module_name,
+        line,
+        message,
+        pid,
+        tid,
+        timestamp,
+    ):
         if level.value >= omni.log.Level.WARN.value:
             level_name = "WARN" if level == omni.log.Level.WARN else "ERROR"
             entry = f"[{level_name}] [{source}] {message}"
@@ -202,7 +236,9 @@ def _ensure_log_listener():
     _log_listener_active = True
 
 
-def get_logs(adapter: IsaacAdapterBase, clear: bool = True, count: int = 100) -> Dict[str, Any]:
+def get_logs(
+    adapter: IsaacAdapterBase, clear: bool = True, count: int = 100
+) -> Dict[str, Any]:
     """Return recent warning/error log messages from the Isaac Sim console."""
     try:
         _ensure_log_listener()
