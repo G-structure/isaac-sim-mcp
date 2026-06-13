@@ -26,6 +26,9 @@
 from __future__ import annotations
 
 import traceback
+import os
+import subprocess
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +41,10 @@ if TYPE_CHECKING:
 
 class IsaacAdapterV5(IsaacAdapterBase):
     """Adapter for Isaac Sim 5.1.0 (isaacsim.* namespace)."""
+
+    def __init__(self) -> None:
+        self._articulation_cache: Dict[str, Any] = {}
+        self._joint_name_cache: Dict[str, List[str]] = {}
 
     # ── Scene ──────────────────────────────────────────────
 
@@ -459,14 +466,15 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
     def _get_joint_names(self, prim_path: str) -> List[str]:
         """Get joint names, trying articulation API first then USD fallback."""
-        from isaacsim.core.prims import SingleArticulation
-
-        self._ensure_physics_world()
-        art = SingleArticulation(prim_path=prim_path)
+        cached = self._joint_name_cache.get(prim_path)
+        if cached is not None:
+            return cached
         try:
-            art.initialize()
+            art = self._get_cached_articulation(prim_path)
             if art.dof_names:
-                return list(art.dof_names)
+                names = list(art.dof_names)
+                self._joint_name_cache[prim_path] = names
+                return names
         except Exception:
             pass
 
@@ -481,17 +489,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
         for desc in Usd.PrimRange(root_prim):
             if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(UsdPhysics.PrismaticJoint):
                 names.append(desc.GetName())
+        self._joint_name_cache[prim_path] = names
         return names
 
     def get_joint_positions(self, prim_path: str) -> List[float]:
-        from isaacsim.core.prims import SingleArticulation
-
-        # Ensure physics is initialized so SingleArticulation.initialize() works
-        self._ensure_physics_world()
-
-        art = SingleArticulation(prim_path=prim_path)
         try:
-            art.initialize()
+            art = self._get_cached_articulation(prim_path)
             positions = art.get_joint_positions()
             if positions is not None:
                 return positions.tolist()
@@ -525,6 +528,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
             else:
                 positions_list.append(0.0)
         return positions_list
+
+    def _get_cached_articulation(self, prim_path: str) -> Any:
+        from isaacsim.core.prims import SingleArticulation
+
+        self._ensure_physics_world()
+        art = self._articulation_cache.get(prim_path)
+        if art is None:
+            art = SingleArticulation(prim_path=prim_path)
+            art.initialize()
+            self._articulation_cache[prim_path] = art
+        return art
 
     def get_joint_config(self, prim_path: str) -> Dict[str, Any]:
         from isaacsim.core.prims import SingleArticulation
@@ -838,13 +852,24 @@ class IsaacAdapterV5(IsaacAdapterBase):
         import omni.kit.commands
 
         status, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
-        omni.kit.commands.execute("URDFParseFile", urdf_path=urdf_path, import_config=import_config)
+        if not status or import_config is None:
+            raise RuntimeError("URDFCreateImportConfig failed")
+        parse_result = omni.kit.commands.execute("URDFParseFile", urdf_path=urdf_path, import_config=import_config)
+        if isinstance(parse_result, tuple) and parse_result and parse_result[0] is False:
+            raise RuntimeError(f"URDFParseFile failed: {parse_result}")
         result = omni.kit.commands.execute(
             "URDFImportRobot",
             urdf_path=urdf_path,
             import_config=import_config,
             dest_path=prim_path,
         )
+        if isinstance(result, tuple) and result and result[0] is False:
+            self.delete_prim(prim_path)
+            raise RuntimeError(f"URDFImportRobot failed: {result}")
+        prim = self.get_stage().GetPrimAtPath(prim_path)
+        if not prim.IsValid():
+            self.delete_prim(prim_path)
+            raise RuntimeError(f"URDF importer completed but produced no valid prim at {prim_path}: {result}")
         return result
 
     # ── Simulation ─────────────────────────────────────────
@@ -864,16 +889,99 @@ class IsaacAdapterV5(IsaacAdapterBase):
         import omni.timeline
 
         omni.timeline.get_timeline_interface().stop()
+        self._articulation_cache.clear()
+        self._joint_name_cache.clear()
+
+    def ping(self) -> Dict[str, Any]:
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        return {
+            "ready": stage is not None,
+            "stage_url": omni.usd.get_context().get_stage_url() or "",
+            "resources": self.get_resources(compact=True),
+        }
+
+    def get_resources(self, compact: bool = False) -> Dict[str, Any]:
+        mem: Dict[str, int] = {}
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key, value = line.split(":", 1)
+                    parts = value.strip().split()
+                    if parts:
+                        mem[key] = int(parts[0])
+        except Exception:
+            mem = {}
+
+        result: Dict[str, Any] = {
+            "available_ram_mb": mem.get("MemAvailable", 0) // 1024 if mem else None,
+            "total_ram_mb": mem.get("MemTotal", 0) // 1024 if mem else None,
+            "swap_free_mb": mem.get("SwapFree", 0) // 1024 if mem else None,
+            "swap_total_mb": mem.get("SwapTotal", 0) // 1024 if mem else None,
+        }
+        if not compact:
+            try:
+                import omni.timeline
+
+                timeline = omni.timeline.get_timeline_interface()
+                result["timeline_state"] = (
+                    "playing" if timeline.is_playing() else "stopped" if timeline.is_stopped() else "paused"
+                )
+            except Exception:
+                result["timeline_state"] = None
+
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free,memory.total",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    os.environ.get("NVIDIA_VISIBLE_DEVICES", "0").split(",")[0],
+                ],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                free, total = [int(part.strip()) for part in proc.stdout.strip().splitlines()[0].split(",")[:2]]
+                result["vram_free_mb"] = free
+                result["vram_total_mb"] = total
+            else:
+                result["vram_free_mb"] = None
+                result["vram_total_mb"] = None
+        except Exception:
+            result["vram_free_mb"] = None
+            result["vram_total_mb"] = None
+
+        return result
 
     def step(
-        self, num_steps: int = 1, observe_prims: Optional[List[str]] = None, observe_joints: Optional[List[str]] = None
+        self,
+        num_steps: int = 1,
+        observe_prims: Optional[List[str]] = None,
+        observe_joints: Optional[List[str]] = None,
+        budget_ms: Optional[int] = None,
+        observe_cap: Optional[int] = None,
     ) -> Dict[str, Any]:
         import omni.kit.app
 
-        for _ in range(num_steps):
+        start = time.monotonic()
+        effective_budget_ms = budget_ms if budget_ms is not None else 8000
+        stepped = 0
+        timed_out = False
+        for _ in range(max(0, num_steps)):
+            if effective_budget_ms > 0 and (time.monotonic() - start) * 1000 >= effective_budget_ms:
+                timed_out = True
+                break
             omni.kit.app.get_app().update()
+            stepped += 1
 
-        result: Dict[str, Any] = {"stepped": num_steps}
+        result: Dict[str, Any] = {"stepped": stepped, "resources": self.get_resources(compact=True)}
+        if timed_out:
+            result["timed_out"] = True
 
         # Observe prim states
         if observe_prims:
@@ -920,7 +1028,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
         # Observe joint states
         if observe_joints:
             joint_states = []
-            for path in observe_joints:
+            resources = result.get("resources") or {}
+            available_ram_mb = resources.get("available_ram_mb")
+            effective_observe_cap = observe_cap
+            if effective_observe_cap is None and isinstance(available_ram_mb, int) and available_ram_mb < 3000:
+                effective_observe_cap = 1
+            observed_paths = list(observe_joints)
+            skipped_paths: List[str] = []
+            if effective_observe_cap is not None and effective_observe_cap >= 0:
+                skipped_paths = observed_paths[effective_observe_cap:]
+                observed_paths = observed_paths[:effective_observe_cap]
+            for path in observed_paths:
                 try:
                     positions = self.get_joint_positions(path)
                     names = self._get_joint_names(path)
@@ -929,6 +1047,10 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 except Exception as e:
                     joint_states.append({"prim_path": path, "error": str(e)})
             result["joint_states"] = joint_states
+            if skipped_paths:
+                result["observe_skipped"] = [
+                    {"prim_path": path, "reason": "art_observe_cap"} for path in skipped_paths
+                ]
 
         return result
 

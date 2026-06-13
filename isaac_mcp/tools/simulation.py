@@ -66,7 +66,11 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
 
     @mcp.tool("step_simulation")
     def step_simulation(
-        num_steps: int = 1, observe_prims: Optional[List[str]] = None, observe_joints: Optional[List[str]] = None
+        num_steps: int = 1,
+        observe_prims: Optional[List[str]] = None,
+        observe_joints: Optional[List[str]] = None,
+        budget_ms: Optional[int] = None,
+        observe_cap: Optional[int] = None,
     ) -> str:
         """Step the simulation forward by N frames, then observe prim and joint states.
 
@@ -85,6 +89,9 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             num_steps: Number of simulation frames to step.
             observe_prims: List of prim paths to observe (returns position + velocity).
             observe_joints: List of articulation prim paths to observe (returns joint positions).
+            budget_ms: Optional wall-clock budget for stepping.
+            observe_cap: Optional cap on articulation observations. Under low RAM,
+                observe one articulation at a time.
         """
         try:
             conn = get_connection()
@@ -93,7 +100,21 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
                 params["observe_prims"] = observe_prims
             if observe_joints is not None:
                 params["observe_joints"] = observe_joints
+            if budget_ms is not None:
+                params["budget_ms"] = budget_ms
+            if observe_cap is not None:
+                params["observe_cap"] = observe_cap
             result = conn.send_command("simulation.step", params)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    @mcp.tool("get_resources")
+    def get_resources() -> str:
+        """Return RAM, swap, VRAM, and timeline telemetry for the Isaac session."""
+        try:
+            conn = get_connection()
+            result = conn.send_command("simulation.get_resources")
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
