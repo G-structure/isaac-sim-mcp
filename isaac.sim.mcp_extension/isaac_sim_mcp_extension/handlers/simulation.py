@@ -42,6 +42,8 @@ def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
     registry["simulation.get_physics_state"] = lambda **p: get_physics_state_handler(adapter, **p)
     registry["simulation.get_joint_config"] = lambda **p: get_joint_config_handler(adapter, **p)
     registry["simulation.reload_script"] = lambda **p: reload_script_handler(adapter, **p)
+    registry["simulation.ping"] = lambda **p: ping(adapter, **p)
+    registry["simulation.get_resources"] = lambda **p: get_resources(adapter, **p)
 
 
 def play(adapter: IsaacAdapterBase) -> Dict[str, Any]:
@@ -73,10 +75,33 @@ def step(
     num_steps: int = 1,
     observe_prims: Optional[Sequence[str]] = None,
     observe_joints: Optional[Sequence[str]] = None,
+    budget_ms: Optional[int] = None,
+    observe_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
-        result = adapter.step(num_steps=num_steps, observe_prims=observe_prims, observe_joints=observe_joints)
-        return {"status": "success", "message": f"Stepped {num_steps} frames", **result}
+        result = adapter.step(
+            num_steps=num_steps,
+            observe_prims=observe_prims,
+            observe_joints=observe_joints,
+            budget_ms=budget_ms,
+            observe_cap=observe_cap,
+        )
+        status = "timeout" if result.get("timed_out") else "success"
+        return {"status": status, "message": f"Stepped {result.get('stepped', 0)} frames", **result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def ping(adapter: IsaacAdapterBase) -> Dict[str, Any]:
+    try:
+        return {"status": "success", **adapter.ping()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def get_resources(adapter: IsaacAdapterBase) -> Dict[str, Any]:
+    try:
+        return {"status": "success", **adapter.get_resources()}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

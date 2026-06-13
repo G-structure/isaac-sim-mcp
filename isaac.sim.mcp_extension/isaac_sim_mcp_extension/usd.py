@@ -247,6 +247,33 @@ class USDLoader:
             carb.log_info(f"Error in _load_prim: {str(e)}")
             return {"error": str(e)}
 
+    def _source_meters_per_unit(self, url: str) -> float | None:
+        try:
+            from pxr import Usd
+
+            source_stage = Usd.Stage.Open(url)
+            if source_stage is None:
+                return None
+            return float(UsdGeom.GetStageMetersPerUnit(source_stage))
+        except Exception as exc:
+            carb.log_info(f"Could not read metersPerUnit for {url}: {exc}")
+            return None
+
+    def _world_bbox(self, prim) -> dict:
+        bbox_cache = UsdGeom.BBoxCache(0.0, [UsdGeom.Tokens.default_], useExtentsHint=True)
+        bbox = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+        min_pt = bbox.GetMin()
+        max_pt = bbox.GetMax()
+        return {
+            "min": [float(min_pt[0]), float(min_pt[1]), float(min_pt[2])],
+            "max": [float(max_pt[0]), float(max_pt[1]), float(max_pt[2])],
+            "size": [
+                float(max_pt[0] - min_pt[0]),
+                float(max_pt[1] - min_pt[1]),
+                float(max_pt[2] - min_pt[2]),
+            ],
+        }
+
     def _set_transform(self, prim, location=None, rotation=None, scale=None):
         """Set transform operations on a USD prim."""
         if not prim.IsA(UsdGeom.Xformable):
@@ -326,11 +353,19 @@ class USDLoader:
             # Create the prim based on type
             # url = "https://omniverse-content-production.s3.us-west-2.amazonaws.com/Assets/DigitalTwin/Assets/Warehouse/Storage/Drums/Plastic_A/PlasticDrum_A04_PR_V_NVD_01.usd"
             prim = self._load_prim(url_path, path=target_path)
+            if isinstance(prim, dict):
+                return prim
             path = str(prim.GetPath())
 
+            stage_mpu = float(UsdGeom.GetStageMetersPerUnit(omni.usd.get_context().get_stage()))
+            source_mpu = self._source_meters_per_unit(url_path)
+            unit_scale = source_mpu / stage_mpu if source_mpu and stage_mpu else 1.0
+            requested_scale = list(scale) if scale is not None else [1.0, 1.0, 1.0]
+            effective_scale = [float(value) * unit_scale for value in requested_scale]
+
             # Apply transform if provided
-            if location or rotation or scale:
-                self._set_transform(prim, location, rotation, scale)
+            if location or rotation or effective_scale != [1.0, 1.0, 1.0]:
+                self._set_transform(prim, location, rotation, effective_scale)
 
             # Apply color if provided
             if color:
@@ -338,7 +373,12 @@ class USDLoader:
 
             # Return object info
             prim_info = {
+                "prim_path": path,
                 "target_path": path,
+                "source_meters_per_unit": source_mpu,
+                "stage_meters_per_unit": stage_mpu,
+                "unit_scale": unit_scale,
+                "applied_scale": effective_scale,
             }
 
             # Add transform information
@@ -350,11 +390,15 @@ class USDLoader:
                 prim_info["transform"] = {
                     "translation": [translation[0], translation[1], translation[2]],
                 }
+            try:
+                prim_info["world_bbox"] = self._world_bbox(prim)
+            except Exception as exc:
+                prim_info["bbox_error"] = str(exc)
 
             _details = json.dumps(prim_info, indent=2)
 
             print(f"Loaded USD model from {url_path} at {path}")
-            return path
+            return prim_info
 
         except Exception as e:
             carb.log_info(f"Error in load_usd_from_url: {str(e)}")
@@ -433,7 +477,7 @@ class USDSearch3d:
                 "NVIDIA_API_KEY environment variable not set, USD Search service is not available untill NVIDIA_API_KEY is set"
             )
 
-    def search(self, text_prompt: str):
+    def search(self, text_prompt: str, catalog=None, exclude=None):
         # get your own NVIDIA_API_KEY from build.nvidia.com
         response = requests.post(
             url=self.usd_search_server,
@@ -457,7 +501,21 @@ class USDSearch3d:
         carb.log_info(f"usd_search_3d_from_text return code: {response.status_code}")
         details = json.dumps(response.json(), indent=2)
         details = json.loads(details)
-        url = details[0]["url"]
+        excluded = {str(item).lower() for item in (exclude or []) if str(item).strip()}
+        if not catalog and any(term in text_prompt.lower() for term in ("surgical", "operating", "medical", " or ")):
+            excluded.add("/warehouse/")
+
+        selected = None
+        for item in details:
+            url = str(item.get("url", ""))
+            lowered_url = url.lower()
+            if catalog and str(catalog).lower() not in lowered_url:
+                continue
+            if any(token in lowered_url for token in excluded):
+                continue
+            selected = url
+            break
+        url = selected or details[0]["url"]
 
         # Convert S3 URL to HTTPS URL if needed
         if url.startswith("s3://deepsearch-demo-content"):

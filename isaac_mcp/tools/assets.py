@@ -86,6 +86,8 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
         target_path: str = "/World/my_usd",
         position: Optional[List[float]] = None,
         scale: Optional[List[float]] = None,
+        catalog: Optional[str] = None,
+        exclude: Optional[List[str]] = None,
     ) -> str:
         """Search the NVIDIA USD asset library by text description, then load the best match.
 
@@ -94,6 +96,8 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             target_path: Prim path for the loaded result.
             position: [x, y, z] world position.
             scale: [sx, sy, sz] scale factors.
+            catalog: Optional URL/category substring to require.
+            exclude: Optional URL/category substrings to skip.
         """
         try:
             conn = get_connection()
@@ -102,6 +106,10 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
                 params["position"] = position
             if scale:
                 params["scale"] = scale
+            if catalog:
+                params["catalog"] = catalog
+            if exclude:
+                params["exclude"] = exclude
             result = conn.send_command("assets.search_usd", params)
             return json.dumps(result, indent=2)
         except Exception as e:

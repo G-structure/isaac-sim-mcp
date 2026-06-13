@@ -49,10 +49,15 @@ def import_urdf(
     try:
         if not urdf_path:
             return {"status": "error", "message": "urdf_path is required"}
-        _result = adapter.import_urdf(urdf_path, prim_path=prim_path)
+        result = adapter.import_urdf(urdf_path, prim_path=prim_path)
         if position:
             adapter.set_prim_transform(prim_path, position=position)
-        return {"status": "success", "message": f"Imported URDF from {urdf_path}", "prim_path": prim_path}
+        return {
+            "status": "success",
+            "message": f"Imported URDF from {urdf_path}",
+            "prim_path": prim_path,
+            "import_result": repr(result),
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -68,8 +73,10 @@ def load_usd(
         if not usd_url:
             return {"status": "error", "message": "usd_url is required"}
         loader = USDLoader()
-        result_path = loader.load_usd_from_url(url_path=usd_url, target_path=prim_path, location=position, scale=scale)
-        return {"status": "success", "message": f"Loaded USD from {usd_url}", "prim_path": result_path}
+        result = loader.load_usd_from_url(url_path=usd_url, target_path=prim_path, location=position, scale=scale)
+        if isinstance(result, dict) and result.get("error"):
+            return {"status": "error", "message": result["error"]}
+        return {"status": "success", "message": f"Loaded USD from {usd_url}", **result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -80,24 +87,28 @@ def search_usd(
     target_path: str = "/World/my_usd",
     position: Optional[Sequence[float]] = None,
     scale: Optional[Sequence[float]] = None,
+    catalog: Optional[str] = None,
+    exclude: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     try:
         if not text_prompt:
             return {"status": "error", "message": "text_prompt is required"}
         searcher = USDSearch3d()
-        url = searcher.search(text_prompt)
+        url = searcher.search(text_prompt, catalog=catalog, exclude=exclude)
         loader = USDLoader()
-        prim_path = loader.load_usd_from_url(
+        result = loader.load_usd_from_url(
             url_path=url,
             target_path=target_path,
             location=position,
             scale=scale,
         )
+        if isinstance(result, dict) and result.get("error"):
+            return {"status": "error", "message": result["error"], "url": url}
         return {
             "status": "success",
             "message": f"Found and loaded USD for '{text_prompt}'",
-            "prim_path": prim_path,
             "url": url,
+            **result,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

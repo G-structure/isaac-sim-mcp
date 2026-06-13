@@ -118,6 +118,14 @@ class IsaacAdapterBase(ABC):
         """
         ...
 
+    def ping(self) -> Dict[str, Any]:
+        """Cheap main-thread health probe."""
+        return {"ready": True}
+
+    def get_resources(self) -> Dict[str, Any]:
+        """Return runtime resource telemetry."""
+        return {}
+
     # ── Robots ─────────────────────────────────────────────
 
     @abstractmethod
@@ -309,7 +317,12 @@ class IsaacAdapterBase(ABC):
 
     @abstractmethod
     def step(
-        self, num_steps: int = 1, observe_prims: Optional[List[str]] = None, observe_joints: Optional[List[str]] = None
+        self,
+        num_steps: int = 1,
+        observe_prims: Optional[List[str]] = None,
+        observe_joints: Optional[List[str]] = None,
+        budget_ms: Optional[int] = None,
+        observe_cap: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Step the simulation forward and optionally observe prim/joint states.
 
@@ -317,6 +330,8 @@ class IsaacAdapterBase(ABC):
             num_steps: Number of frames to step.
             observe_prims: Prim paths to snapshot after stepping (transform + velocity).
             observe_joints: Articulation paths to snapshot (joint positions).
+            budget_ms: Optional wall-clock budget.
+            observe_cap: Optional cap on articulation observations.
         """
         ...
 
