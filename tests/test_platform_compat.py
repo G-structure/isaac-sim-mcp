@@ -9,6 +9,7 @@ EXTENSION_ROOT = (
 )
 EXTENSION_PATH = EXTENSION_ROOT / "extension.py"
 HANDLERS_ROOT = EXTENSION_ROOT / "handlers"
+USD_PATH = EXTENSION_ROOT / "usd.py"
 
 
 def _extension_source() -> str:
@@ -56,6 +57,7 @@ def test_legacy_alias_targets_map_to_registered_handlers():
         "simulation.execute_script",
         "assets.generate_3d",
         "assets.search_usd",
+        "assets.search_usd_candidates",
     }
     assert expected_alias_targets <= commands
     assert "_legacy_omni_kit_command" in source
@@ -97,3 +99,18 @@ def test_extension_does_not_autosave_scene_usd():
     assert "_on_autosave_tick" not in methods
     assert "_export_workspace_stage_async" not in methods
     assert "_stop_autosave" not in methods
+
+
+def test_usd_search_has_non_mutating_candidate_path_and_diagnostics():
+    source = USD_PATH.read_text()
+    tree = ast.parse(source)
+    methods = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+
+    assert "search_candidates" in methods
+    assert "_response_items" in methods
+    assert "_image_from_item" in methods
+    assert "timeout=25" in source
+    assert "status_code" in source
+    assert "candidate_count" in source
+    assert "rejected_count" in source
+    assert "image_url" in source

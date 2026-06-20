@@ -115,6 +115,36 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
 
+    @mcp.tool("search_usd_candidates")
+    def search_usd_candidates(
+        text_prompt: str,
+        catalog: Optional[str] = None,
+        exclude: Optional[List[str]] = None,
+        limit: int = 8,
+    ) -> str:
+        """Search the NVIDIA USD asset library without loading a result.
+
+        Use this before ``search_usd`` to inspect candidate names, URLs, and
+        preview image URLs so bad semantic matches do not mutate the live stage.
+
+        Args:
+            text_prompt: Text description of the 3D asset to search for.
+            catalog: Optional URL/category substring to require.
+            exclude: Optional URL/category substrings to skip.
+            limit: Maximum candidates to return.
+        """
+        try:
+            conn = get_connection()
+            params = {"text_prompt": text_prompt, "limit": limit}
+            if catalog:
+                params["catalog"] = catalog
+            if exclude:
+                params["exclude"] = exclude
+            result = conn.send_command("assets.search_usd_candidates", params)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
     @mcp.tool("generate_3d")
     def generate_3d(
         text_prompt: Optional[str] = None,

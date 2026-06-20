@@ -36,6 +36,7 @@ from ..adapters.base import IsaacAdapterBase
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
     registry["assets.import_urdf"] = lambda **p: import_urdf(adapter, **p)
     registry["assets.load_usd"] = lambda **p: load_usd(adapter, **p)
+    registry["assets.search_usd_candidates"] = lambda **p: search_usd_candidates(adapter, **p)
     registry["assets.search_usd"] = lambda **p: search_usd(adapter, **p)
     registry["assets.generate_3d"] = lambda **p: generate_3d(adapter, **p)
 
@@ -94,7 +95,11 @@ def search_usd(
         if not text_prompt:
             return {"status": "error", "message": "text_prompt is required"}
         searcher = USDSearch3d()
-        url = searcher.search(text_prompt, catalog=catalog, exclude=exclude)
+        search_result = searcher.search_candidates(text_prompt, catalog=catalog, exclude=exclude, limit=5)
+        if search_result.get("status") != "success":
+            return search_result
+        selected = search_result["candidates"][0]
+        url = selected["url"]
         loader = USDLoader()
         result = loader.load_usd_from_url(
             url_path=url,
@@ -108,8 +113,27 @@ def search_usd(
             "status": "success",
             "message": f"Found and loaded USD for '{text_prompt}'",
             "url": url,
+            "selected_candidate": selected,
+            "search_diagnostics": search_result.get("diagnostics", {}),
+            "rejected_candidates": search_result.get("rejected", [])[:10],
             **result,
         }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def search_usd_candidates(
+    adapter: IsaacAdapterBase,
+    text_prompt: Optional[str] = None,
+    catalog: Optional[str] = None,
+    exclude: Optional[Sequence[str]] = None,
+    limit: int = 8,
+) -> Dict[str, Any]:
+    try:
+        if not text_prompt:
+            return {"status": "error", "message": "text_prompt is required"}
+        searcher = USDSearch3d()
+        return searcher.search_candidates(text_prompt, catalog=catalog, exclude=exclude, limit=limit)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

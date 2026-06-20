@@ -189,10 +189,13 @@ class MCPExtension(omni.ext.IExt):
                 if result and result.get("status") == "success":
                     return {"status": "success", "result": result}
                 else:
-                    return {
+                    error_result = {
                         "status": "error",
                         "message": result.get("message", "Unknown error") if result else "No result",
                     }
+                    if result:
+                        error_result["result"] = result
+                    return error_result
             except Exception as e:
                 traceback.print_exc()
                 return {"status": "error", "message": str(e)}

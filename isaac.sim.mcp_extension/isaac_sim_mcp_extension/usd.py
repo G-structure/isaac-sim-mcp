@@ -477,52 +477,171 @@ class USDSearch3d:
                 "NVIDIA_API_KEY environment variable not set, USD Search service is not available untill NVIDIA_API_KEY is set"
             )
 
-    def search(self, text_prompt: str, catalog=None, exclude=None):
-        # get your own NVIDIA_API_KEY from build.nvidia.com
-        response = requests.post(
-            url=self.usd_search_server,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(
-                dict(
-                    description=text_prompt,
-                    file_extension_include="usd*",
-                    return_images="true",
-                    return_metadata="true",
-                    return_vision_generated_metadata="true",
-                    cutoff_threshold="1.05",
-                    limit="50",
-                )
-            ),
-        )
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        if url.startswith("s3://deepsearch-demo-content"):
+            return url.replace(
+                "s3://deepsearch-demo-content", "https://omniverse-content-production.s3.us-west-2.amazonaws.com"
+            )
+        return url
+
+    @staticmethod
+    def _response_items(payload):
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+        for key in ("results", "data", "items", "assets"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return items
+        return []
+
+    @staticmethod
+    def _image_from_item(item):
+        for key in ("image_url", "thumbnail_url", "thumbnail", "preview_url"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                return value
+        images = item.get("images")
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, str):
+                return first
+            if isinstance(first, dict):
+                for key in ("url", "image_url", "thumbnail_url"):
+                    value = first.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+        return None
+
+    def search_candidates(self, text_prompt: str, catalog=None, exclude=None, limit=8):
+        limit = max(1, min(int(limit or 8), 20))
+        diagnostics = {
+            "query": text_prompt,
+            "catalog": catalog,
+            "exclude": list(exclude or []),
+            "service": self.usd_search_server,
+            "request_limit": 50,
+        }
+        try:
+            response = requests.post(
+                url=self.usd_search_server,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(
+                    dict(
+                        description=text_prompt,
+                        file_extension_include="usd*",
+                        return_images="true",
+                        return_metadata="true",
+                        return_vision_generated_metadata="true",
+                        cutoff_threshold="1.05",
+                        limit="50",
+                    )
+                ),
+                timeout=25,
+            )
+        except requests.RequestException as exc:
+            diagnostics["exception"] = type(exc).__name__
+            return {
+                "status": "error",
+                "message": f"USD search request failed: {exc}",
+                "candidates": [],
+                "rejected": [],
+                "diagnostics": diagnostics,
+            }
+
+        diagnostics["status_code"] = response.status_code
         carb.log_info(f"usd_search_3d_from_text return code: {response.status_code}")
-        details = json.dumps(response.json(), indent=2)
-        details = json.loads(details)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            diagnostics["body_preview"] = response.text[:500]
+            return {
+                "status": "error",
+                "message": f"USD search returned non-JSON response: {exc}",
+                "candidates": [],
+                "rejected": [],
+                "diagnostics": diagnostics,
+            }
+
+        if response.status_code >= 400:
+            diagnostics["body_preview"] = str(payload)[:500]
+            return {
+                "status": "error",
+                "message": f"USD search HTTP {response.status_code}",
+                "candidates": [],
+                "rejected": [],
+                "diagnostics": diagnostics,
+            }
+
+        items = self._response_items(payload)
+        diagnostics["raw_count"] = len(items)
+        diagnostics["payload_shape"] = type(payload).__name__
         excluded = {str(item).lower() for item in (exclude or []) if str(item).strip()}
         if not catalog and any(term in text_prompt.lower() for term in ("surgical", "operating", "medical", " or ")):
             excluded.add("/warehouse/")
 
-        selected = None
-        for item in details:
-            url = str(item.get("url", ""))
+        candidates = []
+        rejected = []
+        required_catalog = str(catalog).lower() if catalog else None
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                rejected.append({"index": index, "reason": "non-object result"})
+                continue
+            raw_url = str(item.get("url", ""))
+            url = self._normalize_url(raw_url)
             lowered_url = url.lower()
-            if catalog and str(catalog).lower() not in lowered_url:
+            if not url:
+                rejected.append({"index": index, "reason": "missing url"})
                 continue
-            if any(token in lowered_url for token in excluded):
+            if required_catalog and required_catalog not in lowered_url:
+                rejected.append({"index": index, "url": url, "reason": "catalog filter"})
                 continue
-            selected = url
-            break
-        url = selected or details[0]["url"]
-
-        # Convert S3 URL to HTTPS URL if needed
-        if url.startswith("s3://deepsearch-demo-content"):
-            url = url.replace(
-                "s3://deepsearch-demo-content", "https://omniverse-content-production.s3.us-west-2.amazonaws.com"
+            matched_exclude = next((token for token in excluded if token in lowered_url), None)
+            if matched_exclude:
+                rejected.append({"index": index, "url": url, "reason": f"exclude filter: {matched_exclude}"})
+                continue
+            candidates.append(
+                {
+                    "index": index,
+                    "url": url,
+                    "name": item.get("name") or item.get("title") or Path(url).name,
+                    "score": item.get("score") or item.get("similarity") or item.get("confidence"),
+                    "image_url": self._image_from_item(item),
+                    "source_url": raw_url,
+                }
             )
-        return url
+            if len(candidates) >= limit:
+                break
+
+        diagnostics["candidate_count"] = len(candidates)
+        diagnostics["rejected_count"] = len(rejected)
+        if not candidates:
+            return {
+                "status": "error",
+                "message": "USD search returned no usable candidates after filters",
+                "candidates": [],
+                "rejected": rejected[:20],
+                "diagnostics": diagnostics,
+            }
+        return {
+            "status": "success",
+            "message": f"Found {len(candidates)} USD candidate(s) for '{text_prompt}'",
+            "candidates": candidates,
+            "rejected": rejected[:20],
+            "diagnostics": diagnostics,
+        }
+
+    def search(self, text_prompt: str, catalog=None, exclude=None):
+        result = self.search_candidates(text_prompt, catalog=catalog, exclude=exclude, limit=1)
+        if result.get("status") != "success":
+            raise RuntimeError(result.get("message", "USD search failed"))
+        return result["candidates"][0]["url"]
 
     @staticmethod
     def test_search_and_load():
