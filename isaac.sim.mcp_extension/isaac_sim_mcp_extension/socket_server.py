@@ -25,11 +25,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import threading
 import time
 import traceback
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict
 
 
@@ -51,13 +53,25 @@ class SocketServer:
         host: str,
         port: int,
         command_handler: Callable[[Dict[str, Any]], Dict[str, Any]],
+        command_timeout: float = 120.0,
     ) -> None:
         self.host = host
         self.port = port
         self._command_handler = command_handler
+        self._command_timeout = command_timeout
         self.running: bool = False
         self._socket: socket.socket | None = None
         self._server_thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
+        """Bind the Kit main asyncio loop used to run command handlers.
+
+        Must be the loop that runs on Isaac's main thread (captured in
+        ``on_startup``). Commands touch USD/stage/timeline APIs that are
+        main-thread only, so the socket worker threads marshal onto this loop.
+        """
+        self._loop = loop
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -129,21 +143,39 @@ class SocketServer:
             client.close()
 
     def _dispatch_command(self, client: socket.socket, command: Dict[str, Any]) -> None:
-        async def execute_wrapper() -> None:
-            try:
-                response = self._command_handler(command)
-                response_json = json.dumps(response)
-                try:
-                    client.sendall(response_json.encode("utf-8"))
-                except Exception:
-                    print("Failed to send response — client disconnected")
-            except Exception as e:
-                traceback.print_exc()
-                try:
-                    client.sendall(json.dumps({"status": "error", "message": str(e)}).encode("utf-8"))
-                except Exception:
-                    pass
+        # This runs on a per-client worker thread. Omniverse USD/stage/timeline
+        # APIs invoked by the handler are main-thread only, so the call is
+        # marshalled onto the Kit asyncio loop with run_coroutine_threadsafe —
+        # the *thread-safe* scheduler that also wakes the loop. (Calling
+        # omni.kit.async_engine.run_coroutine() directly from this worker thread
+        # enqueued the coroutine without a thread-safe wakeup, so it was never
+        # pumped and every command — including simulation.ping — timed out,
+        # which kept the bridge from ever registering.)
+        response = self._run_command_on_main_loop(command)
+        try:
+            client.sendall(json.dumps(response).encode("utf-8"))
+        except Exception:
+            print("Failed to send response — client disconnected")
 
-        from omni.kit.async_engine import run_coroutine
+    def _run_command_on_main_loop(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            # Loop not captured yet (briefly, right after on_startup) or shutting
+            # down. Return an error so the socket stays responsive and the client
+            # retries, rather than blocking this worker thread indefinitely.
+            return {"status": "error", "message": "Isaac main loop not ready"}
 
-        run_coroutine(execute_wrapper())
+        async def _call() -> Dict[str, Any]:
+            return self._command_handler(command)
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_call(), loop)
+            return future.result(timeout=self._command_timeout)
+        except FutureTimeoutError:
+            return {
+                "status": "error",
+                "message": f"Command timed out after {self._command_timeout}s on Isaac main loop",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
