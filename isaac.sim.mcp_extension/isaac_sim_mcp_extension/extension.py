@@ -75,6 +75,12 @@ class MCPExtension(omni.ext.IExt):
 
         self._server = SocketServer(host, port, self._execute_command)
         self._server.start()
+        # Commands run Omniverse APIs that are main-thread only. The socket server
+        # accepts connections on worker threads, so it needs the Kit main asyncio
+        # loop to marshal calls onto. Capture it on the main thread (here) via a
+        # one-shot coroutine: run_coroutine is safe to call from the main thread,
+        # and get_running_loop() inside it returns the actual Kit loop.
+        self._bind_main_loop()
         # NOTE: workspace stage persistence is owned EXCLUSIVELY by warm_slot_agent
         # (save_open_stage), which saves the open root layer IN PLACE and coordinates
         # with the S3 sync daemon. The extension intentionally does NOT autosave: a
@@ -82,6 +88,17 @@ class MCPExtension(omni.ext.IExt):
         # raced the agent and the sync daemon, dropped sublayers/references on every
         # flatten, stacked overlapping exports, and swallowed coroutine-body errors.
         # See issue "two-writers-open-root".
+
+    def _bind_main_loop(self) -> None:
+        import asyncio
+
+        from omni.kit.async_engine import run_coroutine
+
+        async def _bind() -> None:
+            if self._server is not None:
+                self._server.set_loop(asyncio.get_running_loop())
+
+        run_coroutine(_bind())
 
     def on_shutdown(self) -> None:
         print("trigger  on_shutdown for: ", self.ext_id)
