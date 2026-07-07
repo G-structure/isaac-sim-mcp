@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_gravity_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -126,13 +127,38 @@ def set_physics(
     gravity: Optional[Sequence[float]] = None,
     time_step: Optional[float] = None,
     gpu_enabled: Optional[bool] = None,
+    solver_position_iteration_count: Optional[int] = None,
+    solver_velocity_iteration_count: Optional[int] = None,
+    substeps: Optional[int] = None,
 ) -> Dict[str, Any]:
+    # Drive the LIVE PhysicsContext (gravity/dt/gpu/solver iters), assert exactly
+    # one active UsdPhysics.PhysicsScene, and return the effective values read
+    # back from the running PhysX context. Previously only gravity was forwarded
+    # (via create_physics_scene) and dt/gpu/iters were silently dropped.
+    # TODO(probe:solver-iters): tune iteration counts for stable 29-DoF contact
+    #   on a live box once measured; 8/4 is a conservative floor.
     try:
-        # Physics params are set via the PhysicsContext on the World
-        # For now, gravity is the most common parameter
-        if gravity is not None:
-            adapter.create_physics_scene(gravity=gravity)
-        return {"status": "success", "message": "Physics parameters updated"}
+        # Physical-gravity gate: reject a session write that sets gravity to zero /
+        # tiny / sideways / upward (a fake-balance vector) on the LIVE context. The
+        # Phase-1 actuation gate only requires gravity != 0, which still admits a tiny
+        # non-physical value; this enforces earth-like, downward gravity for sessions.
+        # OPERATOR bypasses; gravity=None (leave unchanged) is allowed.
+        rejection = guard_gravity_write(adapter, gravity)
+        if rejection is not None:
+            return rejection
+        effective = adapter.apply_physics_params(
+            gravity=gravity,
+            time_step=time_step,
+            gpu_enabled=gpu_enabled,
+            solver_position_iteration_count=solver_position_iteration_count,
+            solver_velocity_iteration_count=solver_velocity_iteration_count,
+            substeps=substeps,
+        )
+        return {
+            "status": "success",
+            "message": "Physics parameters updated",
+            "effective": effective,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

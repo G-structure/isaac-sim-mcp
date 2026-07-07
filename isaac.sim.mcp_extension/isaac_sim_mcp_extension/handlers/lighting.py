@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_pose_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -49,6 +50,14 @@ def create(
             stage = adapter.get_stage()
             count = len(list(stage.TraverseAll()))
             prim_path = f"/World/{light_type}_{count}"
+        # Sink guard: create_light UsdLux.*.Define()s the prim AND set_prim_transform's
+        # it (position/rotation) — defining or posing AT (or under) a robot
+        # articulation-root while the timeline is not stopped is a disguised
+        # teleport/overwrite. Route the resolved path (auto-name default included)
+        # through the same fail-closed pose lock objects.transform uses.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         adapter.create_light(
             light_type, prim_path, intensity=intensity, color=color, position=position, rotation=rotation
         )

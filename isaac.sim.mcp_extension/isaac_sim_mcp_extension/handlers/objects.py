@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_pose_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -52,6 +53,13 @@ def create(
             stage = adapter.get_stage()
             count = len(list(stage.TraverseAll()))
             prim_path = f"/World/{object_type}_{count}"
+        # Sink guard: creating/re-defining or transforming a prim AT a robot
+        # articulation-root while the timeline is not stopped is a disguised robot
+        # teleport/overwrite. Route it through the same fail-closed pose lock the
+        # dispatch-level guard applies to objects.transform (POSE_WRITE_COMMANDS).
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         _prim = adapter.create_prim(prim_path, prim_type=object_type)
         if position or rotation or scale:
             adapter.set_prim_transform(prim_path, position=position, rotation=rotation, scale=scale)
@@ -84,6 +92,15 @@ def delete(adapter: IsaacAdapterBase, prim_path: Optional[str] = None) -> Dict[s
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
+        # Sink guard: deleting a prim that IS (or descends from) a robot
+        # articulation-root while the timeline is not stopped is the delete half of a
+        # delete+recreate reposition cheat (drop the robot, respawn it in a faked
+        # pose). Route the target through the same fail-closed lock as
+        # objects.transform; a fresh/non-robot prim or a stopped sim is allowed and
+        # operator bypasses.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         adapter.delete_prim(prim_path)
         return {"status": "success", "message": f"Deleted {prim_path}"}
     except Exception as e:
@@ -115,6 +132,12 @@ def clone(
     try:
         if not source_path or not target_path:
             return {"status": "error", "message": "source_path and target_path are required"}
+        # Sink guard: cloning OVER (or moving a clone onto) a robot articulation-root
+        # while the timeline is not stopped is a disguised robot teleport/overwrite.
+        # Route the clone destination through the same fail-closed pose lock.
+        rejection = guard_pose_write(adapter, target_path)
+        if rejection is not None:
+            return rejection
         adapter.clone_prim(source_path, target_path)
         if position:
             adapter.set_prim_transform(target_path, position=position)

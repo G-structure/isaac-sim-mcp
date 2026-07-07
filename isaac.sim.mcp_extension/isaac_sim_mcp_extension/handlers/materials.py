@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_pose_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -51,6 +52,15 @@ def create(
             stage = adapter.get_stage()
             count = len(list(stage.TraverseAll()))
             prim_path = f"/World/Material_{count}"
+        # Sink guard: create_pbr_material (UsdShade.Material/Shader.Define) and
+        # create_physics_material (stage.DefinePrim) author a prim AT the
+        # caller-controlled path; a path resolving onto (or under) a robot
+        # articulation-root while the timeline is not stopped overwrites it. Route
+        # the resolved path (auto-name default included) through the fail-closed
+        # pose lock objects.transform uses; operator bypasses, fresh/stopped allowed.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         if material_type == "pbr":
             adapter.create_pbr_material(prim_path, color=color, roughness=roughness, metallic=metallic)
         elif material_type == "physics":
@@ -70,6 +80,15 @@ def apply_material(
     try:
         if not material_path or not target_prim_path:
             return {"status": "error", "message": "material_path and target_prim_path are required"}
+        # Sink guard: apply_material issues UsdShade.MaterialBindingAPI(target).Bind on
+        # the caller-controlled target_prim_path — authoring a binding relationship
+        # ONTO a robot articulation-root (or a descendant / ancestor of one) while the
+        # timeline is not stopped mutates the live robot prim. Route it through the same
+        # fail-closed pose lock the other authoring sinks use; operator bypasses and a
+        # fresh/non-robot path or a stopped sim is allowed.
+        rejection = guard_pose_write(adapter, target_prim_path)
+        if rejection is not None:
+            return rejection
         adapter.apply_material(material_path, target_prim_path)
         return {"status": "success", "message": f"Applied {material_path} to {target_prim_path}"}
     except Exception as e:

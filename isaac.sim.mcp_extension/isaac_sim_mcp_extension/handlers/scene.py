@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_gravity_write, guard_pose_write
 
 _discovered_envs: Optional[Dict[str, Dict[str, str]]] = None
 
@@ -63,6 +64,21 @@ def create_physics(
     adapter: IsaacAdapterBase, gravity: Optional[Sequence[float]] = None, scene_name: str = "PhysicsScene"
 ) -> Dict[str, Any]:
     try:
+        # Physical-gravity gate: a session may not author a zero / tiny / sideways /
+        # upward gravity (a fake-balance vector) into a new physics scene. OPERATOR
+        # bypasses; gravity=None (engine default) is allowed.
+        rejection = guard_gravity_write(adapter, gravity)
+        if rejection is not None:
+            return rejection
+        # Sink guard: create_physics_scene issues a CreatePrim at the
+        # caller-controlled /World/<scene_name>; a scene_name resolving onto (or
+        # under) a robot articulation-root would author a PhysicsScene over it while
+        # the sim runs. Guard the resolved path with the same fail-closed pose lock
+        # (operator bypasses; a fresh/non-robot path or a stopped sim is allowed).
+        scene_path = f"/World/{scene_name}"
+        rejection = guard_pose_write(adapter, scene_path)
+        if rejection is not None:
+            return rejection
         scene_path = adapter.create_physics_scene(gravity=gravity, scene_name=scene_name)
         # Create ground plane with collision so objects don't fall through
         floor_path = "/World/groundPlane"
@@ -92,12 +108,25 @@ def clear(adapter: IsaacAdapterBase, keep_physics: bool = False) -> Dict[str, An
         }
         # Clear all root-level prims (robots created at root, etc.)
         root_prim = stage.GetPseudoRoot()
+        to_delete = []
         for child in root_prim.GetChildren():
             path = str(child.GetPath())
             if path in keep_paths:
                 continue
             if keep_physics and "Physics" in path:
                 continue
+            to_delete.append(path)
+        # Sink guard: scene.clear is a bulk delete_prim over every root-level prim —
+        # including a robot articulation-root — so it is a delete+recreate reposition
+        # vector just like objects.delete. Fail closed and ATOMIC: if ANY target is
+        # (or descends from) a robot root while the timeline is not stopped, reject
+        # the whole clear BEFORE deleting anything (operator bypasses; non-robot
+        # prims and a stopped sim are allowed).
+        for path in to_delete:
+            rejection = guard_pose_write(adapter, path)
+            if rejection is not None:
+                return rejection
+        for path in to_delete:
             adapter.delete_prim(path)
         return {"status": "success", "message": "Scene cleared"}
     except Exception as e:
@@ -167,6 +196,14 @@ def load_environment(
         if not match:
             available = list(library.keys())[:15]
             return {"status": "error", "message": f"Environment '{environment}' not found. Options: {available}"}
+
+        # Sink guard: an add_reference_to_stage that drops an environment reference
+        # onto (or over) a robot articulation-root while the timeline is not stopped is
+        # a disguised teleport/overwrite. Route the caller-controlled prim_path through
+        # the same fail-closed pose lock objects.transform/create use. OPERATOR bypasses.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
 
         assets_root = adapter.get_assets_root_path()
         full_path = assets_root + match["asset_path"]

@@ -38,6 +38,7 @@ import importlib.util
 import json
 import os
 import socket
+import struct
 import threading
 import time
 
@@ -81,12 +82,31 @@ def _loop_in_thread():
     return loop, thread, ident_box["ident"]
 
 
+def _recv_exact(client: socket.socket, num_bytes: int) -> bytes:
+    chunks = []
+    remaining = num_bytes
+    while remaining > 0:
+        data = client.recv(remaining)
+        if not data:
+            raise AssertionError("socket closed before full frame")
+        chunks.append(data)
+        remaining -= len(data)
+    return b"".join(chunks)
+
+
 def _roundtrip(port: int, command: dict) -> dict:
+    """Framed round-trip: 4-byte big-endian length prefix + JSON, both ways.
+
+    The default (session-mode) SocketServer speaks the framed protocol; token is
+    unset here so only framing is exercised.
+    """
     client = socket.create_connection(("localhost", port), timeout=5)
     try:
-        client.sendall(json.dumps(command).encode("utf-8"))
+        body = json.dumps(command).encode("utf-8")
+        client.sendall(struct.pack(">I", len(body)) + body)
         client.settimeout(5)
-        data = client.recv(65536)
+        (length,) = struct.unpack(">I", _recv_exact(client, 4))
+        data = _recv_exact(client, length)
     finally:
         client.close()
     return json.loads(data.decode("utf-8"))
@@ -136,3 +156,114 @@ def test_command_before_loop_bound_returns_error_not_hang():
 
     assert resp["status"] == "error"
     assert "not ready" in resp["message"]
+
+
+def _capability_server(mod, port, seen):
+    """A framed SocketServer configured with both tokens; the handler records the
+    command it was dispatched (so tests can read the authenticated ``capability``
+    tag and confirm the token was stripped)."""
+    def handler(command):
+        seen["command"] = command
+        return {"status": "success", "result": {"echo": command["type"]}}
+
+    return mod.SocketServer(
+        "localhost", port, handler, operator_token="op-secret", session_token="s3cret"
+    )
+
+
+def test_framed_operator_token_classified_operator_and_stripped():
+    mod = _load_socket_server()
+    loop, _thread, _ident = _loop_in_thread()
+    seen = {}
+    port = _free_port()
+    server = _capability_server(mod, port, seen)
+    server.set_loop(loop)
+    server.start()
+    try:
+        resp = _roundtrip(port, {"type": "simulation.ping", "token": "op-secret"})
+    finally:
+        server.stop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert resp["status"] == "success"
+    # The operator token authenticates the command as full ``operator`` capability,
+    # and is stripped before the handler sees it.
+    assert seen["command"]["capability"] == "operator"
+    assert "token" not in seen["command"]
+
+
+def test_framed_session_token_classified_session_and_stripped():
+    mod = _load_socket_server()
+    loop, _thread, _ident = _loop_in_thread()
+    seen = {}
+    port = _free_port()
+    server = _capability_server(mod, port, seen)
+    server.set_loop(loop)
+    server.start()
+    try:
+        resp = _roundtrip(port, {"type": "simulation.ping", "token": "s3cret"})
+    finally:
+        server.stop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert resp["status"] == "success"
+    assert seen["command"]["capability"] == "session"
+    assert "token" not in seen["command"]
+
+
+def test_framed_missing_token_defaults_to_session_capability():
+    # Fail-safe: a missing token is served (not rejected) but at the least-privilege
+    # ``session`` level — the guards + exec-command lock then keep it harmless.
+    mod = _load_socket_server()
+    loop, _thread, _ident = _loop_in_thread()
+    seen = {}
+    port = _free_port()
+    server = _capability_server(mod, port, seen)
+    server.set_loop(loop)
+    server.start()
+    try:
+        resp = _roundtrip(port, {"type": "simulation.ping"})  # no token supplied
+    finally:
+        server.stop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert resp["status"] == "success"
+    assert seen["command"]["capability"] == "session"
+
+
+def test_framed_unknown_token_defaults_to_session_capability():
+    mod = _load_socket_server()
+    loop, _thread, _ident = _loop_in_thread()
+    seen = {}
+    port = _free_port()
+    server = _capability_server(mod, port, seen)
+    server.set_loop(loop)
+    server.start()
+    try:
+        resp = _roundtrip(port, {"type": "simulation.ping", "token": "bogus"})
+    finally:
+        server.stop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert resp["status"] == "success"
+    assert seen["command"]["capability"] == "session"
+
+
+def test_framed_client_cannot_self_escalate_capability():
+    # A client-supplied ``capability`` field must be overwritten by the authenticated
+    # value: presenting no operator token stays ``session`` even if it claims operator.
+    mod = _load_socket_server()
+    loop, _thread, _ident = _loop_in_thread()
+    seen = {}
+    port = _free_port()
+    server = _capability_server(mod, port, seen)
+    server.set_loop(loop)
+    server.start()
+    try:
+        resp = _roundtrip(port, {"type": "simulation.ping", "capability": "operator"})
+    finally:
+        server.stop()
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert resp["status"] == "success"
+    assert seen["command"]["capability"] == "session"
