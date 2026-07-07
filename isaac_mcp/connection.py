@@ -29,12 +29,39 @@ import json
 import logging
 import os
 import socket
+import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("IsaacMCPServer")
 
 DEFAULT_PORT = 8766
+
+# Hard ceiling on a single framed response, mirrors the extension's socket_server.
+_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+def _session_mode_enabled() -> bool:
+    """Match the extension: session-safe (framed+token) unless MCP_SESSION_MODE is falsey."""
+    raw = os.environ.get("MCP_SESSION_MODE")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _session_token() -> Optional[str]:
+    token = os.environ.get("MCP_SESSION_TOKEN")
+    return token or None
+
+
+def _operator_token() -> Optional[str]:
+    """The full-capability OPERATOR token from the environment, or ``None``.
+
+    Held only by trusted bootstrap callers (g1_autospawn, warm_slot_agent); the
+    untrusted agent path never sets it and stays on the restricted session token.
+    """
+    token = os.environ.get("MCP_OPERATOR_TOKEN")
+    return token or None
 
 
 @dataclass
@@ -43,12 +70,35 @@ class IsaacConnection:
 
     host: str = "localhost"
     port: int = 0
+    # Per-operation socket timeout (seconds). MUST stay >= the extension's
+    # SocketServer.command_timeout so the client never gives up before the server
+    # emits its framed response — a late response would desync the length-prefixed
+    # stream. Default 300s covers the server's 290s ceiling and the 120s/300s
+    # bridge budgets (all clients now share this one floor).
+    timeout: float = 300.0
+    # Capability token attached verbatim to every framed request. Trusted
+    # bootstrap callers (g1_autospawn, warm_slot_agent) pass the OPERATOR token so
+    # their execute_script / scene-setup keeps working under the per-token model;
+    # leaving it None falls back to MCP_SESSION_TOKEN so the untrusted agent path
+    # (bridge -> gateway) stays restricted. The extension maps the presented token
+    # to a capability (operator|session) and a missing/unknown token fails safe to
+    # the restricted session level.
+    token: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.port == 0:
             self.port = int(os.environ.get("ISAAC_MCP_PORT", DEFAULT_PORT))
+        # Wire protocol is chosen symmetrically with the extension server. Default
+        # is the length-framed + token protocol; the legacy raw-JSON path is only
+        # used when MCP_SESSION_MODE is explicitly disabled.
+        self.framed = _session_mode_enabled()
+        # An explicit token (e.g. the operator token) wins; otherwise fall back to
+        # the per-session token from the environment.
+        if self.token is None:
+            self.token = _session_token()
 
     sock: Optional[socket.socket] = field(default=None, repr=False)
+    framed: bool = field(default=True, repr=False)
 
     def connect(self) -> bool:
         if self.sock:
@@ -74,7 +124,7 @@ class IsaacConnection:
 
     def receive_full_response(self, sock: socket.socket, buffer_size: int = 16384) -> bytes:
         chunks = []
-        sock.settimeout(300.0)
+        sock.settimeout(self.timeout)
         try:
             while True:
                 try:
@@ -106,20 +156,56 @@ class IsaacConnection:
                 raise Exception("Incomplete JSON response received")
         raise Exception("No data received")
 
-    def send_command(self, command_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _recv_exact(sock: socket.socket, num_bytes: int) -> Optional[bytes]:
+        chunks = []
+        remaining = num_bytes
+        while remaining > 0:
+            data = sock.recv(min(remaining, 65536))
+            if not data:
+                return None
+            chunks.append(data)
+            remaining -= len(data)
+        return b"".join(chunks)
+
+    def _recv_framed(self, sock: socket.socket) -> Dict[str, Any]:
+        header = self._recv_exact(sock, 4)
+        if header is None:
+            raise Exception("Connection closed before frame header")
+        (length,) = struct.unpack(">I", header)
+        if length == 0 or length > _MAX_MESSAGE_BYTES:
+            raise Exception(f"Invalid frame length {length}")
+        payload = self._recv_exact(sock, length)
+        if payload is None:
+            raise Exception("Connection closed mid-frame")
+        return json.loads(payload.decode("utf-8"))
+
+    def send_command_full(self, command_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a command and return the FULL response envelope (``status`` +
+        ``result`` + any top-level fields), WITHOUT extracting ``result`` or
+        raising on an error status.
+
+        Uses the same wire protocol as :meth:`send_command` — length-framed +
+        per-session token by default, legacy raw-JSON when ``MCP_SESSION_MODE`` is
+        off — so transport wrappers that need the raw status envelope (e.g. the
+        session bridge, which forwards the server's status to the control plane)
+        reuse this ONE framing implementation instead of re-deriving it.
+        """
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Isaac")
 
         command = {"type": command_type, "params": params or {}}
         try:
+            self.sock.settimeout(self.timeout)
+            if self.framed:
+                if self.token:
+                    command["token"] = self.token
+                body = json.dumps(command).encode("utf-8")
+                self.sock.sendall(struct.pack(">I", len(body)) + body)
+                return self._recv_framed(self.sock)
             self.sock.sendall(json.dumps(command).encode("utf-8"))
-            self.sock.settimeout(300.0)
             response_data = self.receive_full_response(self.sock)
-            response = json.loads(response_data.decode("utf-8"))
-
-            if response.get("status") == "error":
-                raise Exception(response.get("message", "Unknown error from Isaac"))
-            return response.get("result", {})
+            return json.loads(response_data.decode("utf-8"))
         except socket.timeout:
             self.sock = None
             raise Exception("Timeout waiting for Isaac response")
@@ -132,6 +218,12 @@ class IsaacConnection:
         except Exception as e:
             self.sock = None
             raise Exception(f"Communication error with Isaac: {e}")
+
+    def send_command(self, command_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        response = self.send_command_full(command_type, params)
+        if response.get("status") == "error":
+            raise Exception(response.get("message", "Unknown error from Isaac"))
+        return response.get("result", {})
 
 
 _isaac_connection: Optional[IsaacConnection] = None

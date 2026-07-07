@@ -40,7 +40,43 @@ import omni.usd
 
 from .adapters import get_adapter
 from .handlers import register_all_handlers
+from .handlers._guards import (
+    OPERATOR_CAPABILITY,
+    SESSION_CAPABILITY,
+    SessionGuard,
+    operator_token,
+    reset_current_capability,
+    session_mode_enabled,
+    session_token,
+    set_current_capability,
+)
 from .socket_server import SocketServer
+
+# Commands that run arbitrary Python, hot-reload it, execute an arbitrary Kit
+# command, or mutate a ScriptNode's script — RCE-equivalent surfaces. They are
+# permitted for the ``operator`` capability (trusted bootstrap: warm_slot_agent,
+# g1_autospawn) and refused for ``session`` (the untrusted bridge->gateway agent)
+# with "forbidden in session mode". create_action_graph is NOT listed here: it
+# stays available to both, but a ScriptNode/script-input payload is rejected for
+# session by the confirmed-sound guard in handlers.graphs.
+_OPERATOR_ONLY_COMMANDS = frozenset(
+    {
+        "simulation.execute_script",
+        "execute_script",
+        "simulation.reload_script",
+        "reload_script",
+        "omini_kit_command",
+        "graphs.edit_action_graph",
+        # G1 driver install is TRUSTED setup: it subscribes a physics-step callback
+        # and spawns a DDS side thread on the articulation, so it is refused for the
+        # untrusted session capability here (before the handler) and permitted only
+        # for operator (g1_autospawn). The agent-facing g1 actuation
+        # (robots.g1.set_joint_command / set_gains / get_lowstate / set_control_mode /
+        # reset) stays session-reachable — it is honest actuation the non-cheating
+        # guards gate — and is NOT listed here.
+        "robots.g1.spawn",
+    }
+)
 
 
 class MCPExtension(omni.ext.IExt):
@@ -51,6 +87,8 @@ class MCPExtension(omni.ext.IExt):
         self._registry: Dict[str, Any] = {}
         self._adapter = None
         self._server: SocketServer | None = None
+        self._session_mode: bool = True
+        self._guard: SessionGuard | None = None
 
     def on_startup(self, ext_id: str) -> None:
         print("trigger  on_startup for: ", ext_id)
@@ -71,9 +109,30 @@ class MCPExtension(omni.ext.IExt):
         self._adapter = get_adapter()
         register_all_handlers(self._registry, self._adapter)
         self._register_legacy_handlers()
-        print(f"Registered {len(self._registry)} command handlers")
 
-        self._server = SocketServer(host, port, self._execute_command)
+        # Session mode (default ON) installs the fail-closed non-cheating guards and
+        # the framed+authenticated wire protocol. The registry keeps the FULL command
+        # surface: the operator-only backdoors are no longer removed process-wide, so
+        # trusted bootstrap presenting the operator token keeps execute_script etc.
+        # The socket authenticates each command's token into an operator/session
+        # capability and _execute_command enforces the split — anything reaching the
+        # loopback :8766 socket bypasses gateway scopes, so the socket + dispatch are
+        # the only place these invariants can be enforced.
+        self._session_mode = session_mode_enabled()
+        self._guard = SessionGuard(self._adapter, session_mode=self._session_mode)
+        print(
+            f"Registered {len(self._registry)} command handlers "
+            f"(session_mode={self._session_mode})"
+        )
+
+        self._server = SocketServer(
+            host,
+            port,
+            self._execute_command,
+            framed=self._session_mode,
+            operator_token=operator_token(),
+            session_token=session_token(),
+        )
         self._server.start()
         # Commands run Omniverse APIs that are main-thread only. The socket server
         # accepts connections on worker threads, so it needs the Kit main asyncio
@@ -106,6 +165,48 @@ class MCPExtension(omni.ext.IExt):
             self._server.stop()
         self._registry.clear()
         gc.collect()
+
+    # ── Per-token capability enforcement (replaces the process-global pop) ─────
+
+    def _capability_denial(
+        self, cmd_type: str, params: Dict[str, Any], capability: str
+    ) -> Dict[str, Any] | None:
+        """Refuse the operator-only exec/script surface, and a session ScriptNode
+        action-graph, when the authenticated capability is ``session``. Returns a
+        rejection dict or ``None`` to allow.
+
+        The full registry is kept, so the operator capability (trusted bootstrap)
+        reaches execute_script / reload_script / omini_kit_command /
+        edit_action_graph and may build ScriptNode graphs; the session capability
+        (the untrusted bridge->gateway agent) is refused here BEFORE the handler,
+        which is the sole place the loopback socket's invariants hold.
+
+        TODO(probe:guard-live): confirm on a live box that a session token is refused
+        with "forbidden in session mode" while the operator token reaches the handler.
+        """
+        if capability == OPERATOR_CAPABILITY:
+            return None
+        if cmd_type in _OPERATOR_ONLY_COMMANDS:
+            return {
+                "status": "error",
+                "message": f"{cmd_type!r} runs operator-only code and is forbidden in session mode",
+                "rejected_by": "session_capability",
+            }
+        # create_action_graph stays available for pure OmniGraph wiring; a ScriptNode/
+        # script-input payload (node type, inputs:script/scriptPath/usePath write or
+        # connection, or the script_file shortcut) is refused for session capability
+        # by the confirmed-sound guard, applied here so a session call cannot slip
+        # past before reaching the handler.
+        if cmd_type in ("graphs.create_action_graph", "create_action_graph"):
+            from .handlers.graphs import _scriptnode_rce_rejection
+
+            return _scriptnode_rce_rejection(
+                nodes=params.get("nodes"),
+                values=params.get("values"),
+                connections=params.get("connections"),
+                script_file=params.get("script_file"),
+            )
+        return None
 
     # ── Legacy command compatibility ──────────────────────────────────────────
 
@@ -199,18 +300,48 @@ class MCPExtension(omni.ext.IExt):
     def _execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         cmd_type = command.get("type", "")
         params = command.get("params", {})
-        handler = self._registry.get(cmd_type)
-        if handler:
-            try:
-                result = handler(**params)
-                if result and result.get("status") == "success":
-                    return {"status": "success", "result": result}
-                else:
-                    return {
-                        "status": "error",
-                        "message": result.get("message", "Unknown error") if result else "No result",
-                    }
-            except Exception as e:
-                traceback.print_exc()
-                return {"status": "error", "message": str(e)}
-        return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+        # socket_server authenticates the token into this tag; trust only an exact
+        # "operator", everything else is the least-privilege session (fail-safe).
+        capability = (
+            OPERATOR_CAPABILITY
+            if command.get("capability") == OPERATOR_CAPABILITY
+            else SESSION_CAPABILITY
+        )
+
+        # Publish the capability so the sink-level guards (objects.create/clone ->
+        # guard_pose_write) and the ScriptNode gate honour operator/session without a
+        # per-handler argument. Reset in finally so it never leaks to the next command.
+        cap_token = set_current_capability(capability)
+        try:
+            denial = self._capability_denial(cmd_type, params, capability)
+            if denial is not None:
+                return denial
+
+            # Fail-closed non-cheating guard runs before any handler; operator
+            # capability bypasses it. A guard fault rejects (never falls open).
+            if self._guard is not None:
+                try:
+                    denial = self._guard.guard(cmd_type, params, capability=capability)
+                except Exception as e:
+                    traceback.print_exc()
+                    return {"status": "error", "message": f"session_guard error (fail-closed): {e}"}
+                if denial is not None:
+                    return denial
+
+            handler = self._registry.get(cmd_type)
+            if handler:
+                try:
+                    result = handler(**params)
+                    if result and result.get("status") == "success":
+                        return {"status": "success", "result": result}
+                    else:
+                        return {
+                            "status": "error",
+                            "message": result.get("message", "Unknown error") if result else "No result",
+                        }
+                except Exception as e:
+                    traceback.print_exc()
+                    return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+        finally:
+            reset_current_capability(cap_token)

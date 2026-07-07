@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_pose_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -45,6 +46,12 @@ def create_camera(
     resolution: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     try:
+        # Sink guard: parenting/posing a camera AT (or under) a robot
+        # articulation-root while the timeline is not stopped can move the robot.
+        # Fail-closed through the same pose lock as objects.transform.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         res = tuple(resolution) if resolution else (1280, 720)
         _cam = adapter.create_camera(prim_path, resolution=res)
         if position or rotation:
@@ -82,6 +89,12 @@ def create_lidar(
     config: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
+        # Sink guard: parenting/posing a lidar AT (or under) a robot
+        # articulation-root while the timeline is not stopped can move the robot.
+        # Fail-closed through the same pose lock as objects.transform.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         adapter.create_lidar(prim_path, config=config)
         if position or rotation:
             adapter.set_prim_transform(prim_path, position=position, rotation=rotation)

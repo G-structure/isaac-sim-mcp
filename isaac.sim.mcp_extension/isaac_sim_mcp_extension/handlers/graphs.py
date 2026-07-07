@@ -28,11 +28,70 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import (
+    OPERATOR_CAPABILITY,
+    REJECTED_BY,
+    current_capability,
+    guard_pose_write,
+    session_mode_enabled,
+)
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
     registry["graphs.create_action_graph"] = lambda **p: create_action_graph(adapter, **p)
     registry["graphs.edit_action_graph"] = lambda **p: edit_action_graph(adapter, **p)
+
+
+# An OmniGraph ScriptNode runs arbitrary Python inside the graph == RCE. In session
+# mode the ENTIRE ScriptNode surface is refused by ABSENCE — the node type itself,
+# any inputs:script / inputs:scriptPath / inputs:usePath write (by attr or by
+# connection), and the script_file shortcut that wires one. This is enforced as a
+# live code path both handlers run before touching OmniGraph, not a source check,
+# and it is not limited to the script_file convenience argument.
+_SCRIPTNODE_TYPE = "omni.graph.scriptnode.scriptnode"
+_SCRIPT_INPUT_TOKENS = ("inputs:script", "inputs:scriptpath", "inputs:usepath")
+
+
+def _touches_script_input(spec: object) -> bool:
+    text = str(spec or "").lower()
+    return any(token in text for token in _SCRIPT_INPUT_TOKENS)
+
+
+def _reject_rce(detail: str) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "message": f"{REJECTED_BY}: {detail} attaches arbitrary Python to a ScriptNode (RCE) "
+        "and is operator-only — disabled in session mode",
+        "rejected_by": REJECTED_BY,
+    }
+
+
+def _scriptnode_rce_rejection(
+    nodes: Optional[List[Dict[str, str]]] = None,
+    values: Optional[List[Dict[str, object]]] = None,
+    connections: Optional[List[List[str]]] = None,
+    script_file: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a rejection dict when a request touches the ScriptNode RCE surface under
+    session capability, else ``None``. Runs before any OmniGraph work so a rejection
+    never needs the (operator-only) scriptnode extension loaded. The operator
+    capability (trusted bootstrap) keeps ScriptNode graphs; the legacy operator/
+    session-mode-off process also skips this."""
+    if not session_mode_enabled() or current_capability() == OPERATOR_CAPABILITY:
+        return None
+    if script_file is not None:
+        return _reject_rce("create_action_graph(script_file=...)")
+    for node in nodes or []:
+        if isinstance(node, dict) and str(node.get("type", "")).strip().lower() == _SCRIPTNODE_TYPE:
+            return _reject_rce(f"a ScriptNode node ({node.get('type')})")
+    for value in values or []:
+        if isinstance(value, dict) and _touches_script_input(value.get("attr", "")):
+            return _reject_rce(f"writing {value.get('attr')!r}")
+    for conn in connections or []:
+        for endpoint in conn or []:
+            if _touches_script_input(endpoint):
+                return _reject_rce(f"connecting to {endpoint!r}")
+    return None
 
 
 def create_action_graph(
@@ -49,6 +108,19 @@ def create_action_graph(
     When script_file is provided, automatically creates OnPlaybackTick → ScriptNode,
     wires them, and attaches the script file via usePath + scriptPath.
     """
+    rejection = _scriptnode_rce_rejection(
+        nodes=nodes, values=values, connections=connections, script_file=script_file
+    )
+    if rejection is not None:
+        return rejection
+    # Sink guard: og.Controller.edit(CREATE_NODES) authors graph prims at the
+    # caller-controlled graph_path; a graph_path resolving onto (or under) a robot
+    # articulation-root would overwrite/author over it while the sim runs. Route it
+    # through the same fail-closed pose lock objects.transform uses (operator
+    # bypasses; a fresh/non-robot path or a stopped sim is allowed).
+    rejection = guard_pose_write(adapter, graph_path)
+    if rejection is not None:
+        return rejection
     try:
         import omni.graph.core as og
 
@@ -154,6 +226,9 @@ def edit_action_graph(
     When script content or script path is changed, automatically resets
     state:omni_initialized to False to force the ScriptNode to reload.
     """
+    rejection = _scriptnode_rce_rejection(values=values, connections=connections)
+    if rejection is not None:
+        return rejection
     try:
         import omni.graph.core as og
 

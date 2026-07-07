@@ -31,6 +31,7 @@ from isaac_sim_mcp_extension.gen3d import Beaver3d
 from isaac_sim_mcp_extension.usd import USDLoader, USDSearch3d
 
 from ..adapters.base import IsaacAdapterBase
+from ._guards import guard_pose_write
 
 
 def register(registry: Dict[str, Any], adapter: IsaacAdapterBase) -> None:
@@ -49,6 +50,11 @@ def import_urdf(
     try:
         if not urdf_path:
             return {"status": "error", "message": "urdf_path is required"}
+        # Sink guard: importing/re-posing over a robot articulation-root while the
+        # timeline is not stopped is a disguised teleport/overwrite. Fail-closed.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         result = adapter.import_urdf(urdf_path, prim_path=prim_path)
         if position:
             adapter.set_prim_transform(prim_path, position=position)
@@ -72,6 +78,11 @@ def load_usd(
     try:
         if not usd_url:
             return {"status": "error", "message": "usd_url is required"}
+        # Sink guard: loading/placing a USD OVER a robot articulation-root while
+        # the timeline is not stopped is a disguised teleport/overwrite. Fail-closed.
+        rejection = guard_pose_write(adapter, prim_path)
+        if rejection is not None:
+            return rejection
         loader = USDLoader()
         result = loader.load_usd_from_url(url_path=usd_url, target_path=prim_path, location=position, scale=scale)
         if isinstance(result, dict) and result.get("error"):
@@ -93,6 +104,11 @@ def search_usd(
     try:
         if not text_prompt:
             return {"status": "error", "message": "text_prompt is required"}
+        # Sink guard: searching-then-loading a USD OVER a robot articulation-root
+        # while the timeline is not stopped is a disguised teleport/overwrite.
+        rejection = guard_pose_write(adapter, target_path)
+        if rejection is not None:
+            return rejection
         searcher = USDSearch3d()
         url = searcher.search(text_prompt, catalog=catalog, exclude=exclude)
         loader = USDLoader()

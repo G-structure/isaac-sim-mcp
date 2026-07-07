@@ -525,6 +525,290 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 # Prismatic joints: positions in meters, USD targets in cm
                 drive.GetTargetPositionAttr().Set(float(value * 100.0))
 
+    def set_gains(
+        self,
+        prim_path: str,
+        kp: Sequence[float],
+        kd: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Write PD gains (Unitree kp [N·m/rad], kd [N·m·s/rad]) to a robot's drives.
+
+        Prefers the articulation controller (PhysX tensor API, SI/radian); falls
+        back to authoring USD DriveAPI stiffness/damping (per-DEGREE) when no
+        running articulation is available. The two paths use DIFFERENT units — the
+        tensor path is the confirmed runtime path (probe-results.md).
+        """
+        from isaacsim.core.prims import SingleArticulation
+
+        from ..g1 import gains as g1_gains
+
+        kp = [float(v) for v in kp]
+        kd = [float(v) for v in kd]
+        idx = np.array(joint_indices) if joint_indices is not None else None
+
+        try:
+            art = SingleArticulation(prim_path=prim_path)
+            art.initialize()
+            controller = art.get_articulation_controller()
+            # CONFIRMED (probe-results.md, 6.0.0-rc.22): the controller path is the
+            # PhysX tensor API, which is RADIAN-based, so Unitree kp/kd pass through
+            # to set_gains(kps, kds) UNSCALED (g1.gains.kp_to_tensor_stiffness /
+            # kd_to_tensor_damping are identity). The per-DEGREE conversion
+            # (kp_to_drive_stiffness) is applied ONLY on the raw USD DriveAPI
+            # fallback below — using it here would mis-scale every gain by 180/pi.
+            tensor_kp = np.array(
+                [g1_gains.kp_to_tensor_stiffness(v) for v in kp], dtype=float
+            )
+            tensor_kd = np.array(
+                [g1_gains.kd_to_tensor_damping(v) for v in kd], dtype=float
+            )
+            if idx is not None:
+                cur_kp, cur_kd = controller.get_gains()
+                cur_kp = np.array(cur_kp, dtype=float)
+                cur_kd = np.array(cur_kd, dtype=float)
+                cur_kp[idx] = tensor_kp
+                cur_kd[idx] = tensor_kd
+                controller.set_gains(kps=cur_kp, kds=cur_kd)
+            else:
+                controller.set_gains(kps=tensor_kp, kds=tensor_kd)
+        except Exception:
+            self._set_drive_gains(prim_path, kp, kd, joint_indices)
+
+    def _set_drive_gains(
+        self,
+        prim_path: str,
+        kp: Sequence[float],
+        kd: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Author USD DriveAPI stiffness/damping — works when sim is stopped.
+
+        Angular (revolute) drives take per-DEGREE units, so Unitree radian gains
+        are scaled via g1.gains. G1 is all-revolute; a prismatic joint would need
+        per-metre scaling instead (flagged inline).
+        """
+        from pxr import Usd, UsdPhysics
+
+        from ..g1 import gains as g1_gains
+
+        stage = self.get_stage()
+        root_prim = stage.GetPrimAtPath(prim_path)
+        if not root_prim.IsValid():
+            raise ValueError(f"Prim not found: {prim_path}")
+
+        joints = []
+        for desc in Usd.PrimRange(root_prim):
+            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                UsdPhysics.PrismaticJoint
+            ):
+                joints.append(desc)
+
+        if joint_indices is not None:
+            targets = list(zip(joint_indices, kp, kd))
+        else:
+            targets = [(i, kp[i], kd[i]) for i in range(min(len(kp), len(kd)))]
+
+        for jidx, kp_val, kd_val in targets:
+            if jidx >= len(joints):
+                continue
+            joint_prim = joints[jidx]
+            is_revolute = joint_prim.IsA(UsdPhysics.RevoluteJoint)
+            drive_type = "angular" if is_revolute else "linear"
+            drive = UsdPhysics.DriveAPI.Get(joint_prim, drive_type)
+            if not drive:
+                drive = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
+            if is_revolute:
+                stiffness = g1_gains.kp_to_drive_stiffness(float(kp_val))
+                damping = g1_gains.kd_to_drive_damping(float(kd_val))
+            else:
+                # Prismatic drives use per-metre units, not the angular per-degree
+                # scaling; G1 has no prismatic DoF so these pass through unscaled
+                # until a linear joint appears.
+                stiffness = float(kp_val)
+                damping = float(kd_val)
+            drive.GetStiffnessAttr().Set(stiffness)
+            drive.GetDampingAttr().Set(damping)
+
+    def set_joint_velocities(
+        self,
+        prim_path: str,
+        velocities: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Command target joint velocities [rad/s] on a robot articulation.
+
+        Each command is clamped to the G1 per-joint velocity ceiling
+        (g1.gains.clamp_velocity) before it reaches either the tensor API or the
+        USD fallback, so an over-speed request can never leave this method.
+        """
+        from isaacsim.core.prims import SingleArticulation
+        from isaacsim.core.utils.types import ArticulationAction
+
+        names = self._get_joint_names(prim_path)
+        if joint_indices is not None:
+            pairs = zip(joint_indices, velocities)
+        else:
+            pairs = enumerate(velocities)
+        dq = [
+            self._g1_velocity_clamp(self._joint_name_at(names, jidx), float(v))
+            for jidx, v in pairs
+        ]
+
+        art = SingleArticulation(prim_path=prim_path)
+        try:
+            art.initialize()
+            action = ArticulationAction(
+                joint_velocities=np.array(dq),
+                joint_indices=np.array(joint_indices) if joint_indices else None,
+            )
+            controller = art.get_articulation_controller()
+            controller.apply_action(action)
+        except Exception:
+            # Fallback: author USD angular drive target velocity (deg/s) so the
+            # command survives with the sim stopped, mirroring the position path.
+            self._set_joint_drive_velocities(prim_path, dq, joint_indices)
+
+    def _set_joint_drive_velocities(
+        self,
+        prim_path: str,
+        velocities: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Set joint drive target velocities via USD API — works when sim stopped."""
+        from pxr import Usd, UsdPhysics
+
+        from ..g1 import gains as g1_gains
+
+        stage = self.get_stage()
+        root_prim = stage.GetPrimAtPath(prim_path)
+        if not root_prim.IsValid():
+            raise ValueError(f"Prim not found: {prim_path}")
+
+        joints = []
+        for desc in Usd.PrimRange(root_prim):
+            if desc.IsA(UsdPhysics.RevoluteJoint) or desc.IsA(
+                UsdPhysics.PrismaticJoint
+            ):
+                joints.append(desc)
+
+        if joint_indices is not None:
+            targets = list(zip(joint_indices, velocities))
+        else:
+            targets = list(enumerate(velocities))
+
+        for jidx, value in targets:
+            if jidx >= len(joints):
+                continue
+            joint_prim = joints[jidx]
+            is_revolute = joint_prim.IsA(UsdPhysics.RevoluteJoint)
+            drive_type = "angular" if is_revolute else "linear"
+            drive = UsdPhysics.DriveAPI.Get(joint_prim, drive_type)
+            if not drive:
+                drive = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
+            if is_revolute:
+                drive.GetTargetVelocityAttr().Set(g1_gains.dq_rad_to_deg(float(value)))
+            else:
+                # Prismatic joints: velocities in m/s, USD targets in cm/s
+                drive.GetTargetVelocityAttr().Set(float(value) * 100.0)
+
+    def set_joint_efforts(
+        self,
+        prim_path: str,
+        efforts: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
+    ) -> None:
+        """Command feed-forward joint torques [N·m], clamped to G1 effort limits.
+
+        CONFIRMED additive (docs/src/design/g1-drive/probe-results.md,
+        6.0.0-rc.22): PhysX SUMS the ArticulationAction joint_efforts feed-forward
+        ON TOP of the DriveAPI PD torque —
+        ``total = kp·(q*−q) + kd·(dq*−dq) + tau_ff`` (clamped to USD maxForce;
+        measured torque moved +60.9 for +60 applied while position held). So this
+        LowCmd tau_ff path is additive as intended; no override / zero-gain
+        redesign is needed. Unmapped joints are zeroed by _g1_effort_clamp
+        (fail-closed).
+        """
+        from isaacsim.core.prims import SingleArticulation
+        from isaacsim.core.utils.types import ArticulationAction
+
+        names = self._get_joint_names(prim_path)
+        if joint_indices is not None:
+            pairs = zip(joint_indices, efforts)
+        else:
+            pairs = enumerate(efforts)
+        # TODO(probe:motor-space): the ankle (confirmed) and waist (inferred) are
+        # parallel A/B linkages; in mode_pr=PR these serial-space clamps are only
+        # approximations. The true clamp is in motor (A/B) space via the linkage
+        # Jacobian (coupling matrix TBD from the on-image USD).
+        tau = [
+            self._g1_effort_clamp(self._joint_name_at(names, jidx), float(t))
+            for jidx, t in pairs
+        ]
+
+        art = SingleArticulation(prim_path=prim_path)
+        try:
+            art.initialize()
+            action = ArticulationAction(
+                joint_efforts=np.array(tau),
+                joint_indices=np.array(joint_indices) if joint_indices else None,
+            )
+            controller = art.get_articulation_controller()
+            controller.apply_action(action)
+        except Exception as exc:
+            # Torque has no authored-USD analogue (unlike a position/velocity
+            # target), so there is no stopped-sim fallback — fail loudly instead.
+            raise RuntimeError(
+                f"joint efforts require a running physics articulation at "
+                f"{prim_path}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _joint_name_at(names: List[str], idx: int) -> Optional[str]:
+        return names[idx] if 0 <= idx < len(names) else None
+
+    @staticmethod
+    def _g1_effort_clamp(joint_name: Optional[str], tau: float) -> float:
+        """FAIL-CLOSED torque clamp to the G1 effort limit for joint_name.
+
+        Accepts either the g1.gains canonical name (e.g. ``left_knee``) or the USD
+        dof name with a trailing ``_joint`` (e.g. ``left_knee_joint``). A joint
+        with no verified limit — an unresolved name, or a DoF absent from
+        G1_JOINT_LIMITS such as a Dex3 hand joint — is ZEROED rather than passed
+        through: an unbounded torque on an unmapped joint is a safety hazard.
+        """
+        if not joint_name:
+            return 0.0
+        from ..g1 import gains as g1_gains
+
+        candidates = [joint_name]
+        if joint_name.endswith("_joint"):
+            candidates.append(joint_name[: -len("_joint")])
+        for name in candidates:
+            if name in g1_gains.G1_JOINT_LIMITS:
+                return g1_gains.clamp_effort_fail_closed(name, tau)
+        return 0.0
+
+    @staticmethod
+    def _g1_velocity_clamp(joint_name: Optional[str], dq: float) -> float:
+        """Clamp a commanded velocity [rad/s] to the G1 per-joint ceiling.
+
+        Mapped joints go through g1.gains.clamp_velocity. Unmapped joints (e.g.
+        Dex3 hand DoFs absent from the table) pass through: velocity is not the
+        fail-closed safety axis — effort is (see _g1_effort_clamp).
+        """
+        if not joint_name:
+            return dq
+        from ..g1 import gains as g1_gains
+
+        candidates = [joint_name]
+        if joint_name.endswith("_joint"):
+            candidates.append(joint_name[: -len("_joint")])
+        for name in candidates:
+            if name in g1_gains.G1_JOINT_LIMITS:
+                return g1_gains.clamp_velocity(name, dq)
+        return dq
+
     def _get_joint_names(self, prim_path: str) -> List[str]:
         """Get joint names, trying articulation API first then USD fallback."""
         cached = self._joint_name_cache.get(prim_path)
@@ -722,6 +1006,190 @@ class IsaacAdapterV5(IsaacAdapterBase):
             result["warnings"] = warnings
         return result
 
+    def get_lowstate_fields(self, prim_path: str) -> Dict[str, Any]:
+        """Assemble the runtime fields needed to populate a Unitree LowState.
+
+        Every value is a PhysX RUNTIME read (never an authored USD target):
+        measured joint efforts, joint positions/velocities, the floating-base
+        world pose + spatial velocity, and an IMU proxy (base angular velocity +
+        gravity projected into the base frame). Returns plain python containers.
+        """
+        result: Dict[str, Any] = {"prim_path": prim_path}
+
+        def _as_list(x: Any) -> Optional[List[float]]:
+            if x is None:
+                return None
+            if hasattr(x, "tolist"):
+                x = x.tolist()
+            return [float(v) for v in x]
+
+        art = self._get_cached_articulation(prim_path)
+        result["q"] = _as_list(art.get_joint_positions())
+        result["dq"] = _as_list(art.get_joint_velocities())
+        result["dof_names"] = list(art.dof_names) if art.dof_names else []
+
+        # tau_est: measured joint efforts from the solver (the true total torque).
+        # CONFIRMED (probe-results.md, 6.0.0-rc.22): an applied joint_efforts
+        # feed-forward is ADDITIVE on top of the DriveAPI PD torque and shows up
+        # in this measurement (moved +60.9 for +60 applied while position held),
+        # so this readback reflects the total torque — no override hedging.
+        try:
+            result["tau_est"] = _as_list(art.get_measured_joint_efforts())
+        except Exception:
+            result["tau_est"] = None
+
+        # Floating-base world pose (runtime physics read).
+        quat: Optional[List[float]] = None
+        try:
+            pos, quat_wxyz = art.get_world_pose()
+            result["root_position"] = _as_list(pos)
+            quat = _as_list(quat_wxyz)
+            result["root_quat_wxyz"] = quat
+        except Exception:
+            result["root_position"] = None
+            result["root_quat_wxyz"] = None
+
+        # Floating-base spatial velocity — prefer articulation runtime reads,
+        # fall back to the PhysX rigid-body interface on the root prim.
+        lin: Optional[List[float]] = None
+        ang: Optional[List[float]] = None
+        try:
+            lin = _as_list(art.get_linear_velocity())
+            ang = _as_list(art.get_angular_velocity())
+        except Exception:
+            pass
+        if lin is None or ang is None:
+            try:
+                import omni.physx
+
+                physx = omni.physx.get_physx_interface()
+                rb = physx.get_rigidbody_transformation(prim_path)
+                if rb and rb.get("ret_val", False):
+                    lin = [float(v) for v in rb.get("linear_velocity", (0.0, 0.0, 0.0))]
+                    ang = [float(v) for v in rb.get("angular_velocity", (0.0, 0.0, 0.0))]
+            except Exception:
+                pass
+        result["root_linear_velocity"] = lin
+        result["root_angular_velocity"] = ang
+
+        # IMU proxy. TODO(probe:imu): the real IMU sits on a specific link with
+        # its own mounting orientation — this uses the articulation-root frame.
+        # The quaternion component order (w, x, y, z, a Unitree convention) AND
+        # its sign must be runtime-verified against a real LowState capture
+        # before this feeds any controller.
+        result["imu"] = {
+            "angular_velocity": ang,
+            "projected_gravity": self._projected_gravity(quat) if quat else None,
+        }
+        return result
+
+    @staticmethod
+    def _projected_gravity(
+        quat_wxyz: Sequence[float],
+        gravity: Sequence[float] = (0.0, 0.0, -1.0),
+    ) -> List[float]:
+        """Gravity direction expressed in the base frame (RL 'projected gravity').
+
+        Rotates the world gravity direction into the body frame via the inverse of
+        the (w, x, y, z) root orientation (IsaacGym quat_rotate_inverse). An
+        upright base returns ~(0, 0, -1). TODO(probe:imu): correctness depends on
+        the quaternion order being (w, x, y, z); confirm at runtime.
+        """
+        w, x, y, z = (
+            float(quat_wxyz[0]),
+            float(quat_wxyz[1]),
+            float(quat_wxyz[2]),
+            float(quat_wxyz[3]),
+        )
+        gx, gy, gz = float(gravity[0]), float(gravity[1]), float(gravity[2])
+        scale = 2.0 * w * w - 1.0
+        ax, ay, az = gx * scale, gy * scale, gz * scale
+        cross_x = y * gz - z * gy
+        cross_y = z * gx - x * gz
+        cross_z = x * gy - y * gx
+        two_w = 2.0 * w
+        bx, by, bz = cross_x * two_w, cross_y * two_w, cross_z * two_w
+        dot = 2.0 * (x * gx + y * gy + z * gz)
+        cx, cy, cz = x * dot, y * dot, z * dot
+        return [ax - bx + cx, ay - by + cy, az - bz + cz]
+
+    def detect_motion(
+        self,
+        prim_path: str,
+        num_steps: int = 2,
+        position_tol: float = 1e-5,
+    ) -> Dict[str, Any]:
+        """Frozen-sim detector: step the sim and report whether DoFs actually moved.
+
+        Compares PhysX RUNTIME reads — articulation joint positions
+        (``get_joint_positions``) and the root rigid-body world transform — taken
+        BEFORE and AFTER stepping. It NEVER consults authored USD drive targets,
+        so a wedged physics pipeline (targets advancing while nothing integrates)
+        is caught: ``advanced`` is False when the largest joint / root delta stays
+        within ``position_tol`` across the steps. Runtime-only by construction.
+        """
+        import omni.kit.app
+
+        def _runtime_q() -> Optional[List[float]]:
+            try:
+                art = self._get_cached_articulation(prim_path)
+                q = art.get_joint_positions()
+            except Exception:
+                return None
+            if q is None:
+                return None
+            return [float(v) for v in (q.tolist() if hasattr(q, "tolist") else q)]
+
+        def _runtime_root() -> Optional[List[float]]:
+            try:
+                import omni.physx
+
+                physx = omni.physx.get_physx_interface()
+                rb = physx.get_rigidbody_transformation(prim_path)
+                if rb and rb.get("ret_val", False):
+                    pos = rb["position"]
+                    return [float(pos[0]), float(pos[1]), float(pos[2])]
+            except Exception:
+                pass
+            return None
+
+        q_before = _runtime_q()
+        root_before = _runtime_root()
+
+        stepped = 0
+        for _ in range(max(1, num_steps)):
+            omni.kit.app.get_app().update()
+            stepped += 1
+
+        q_after = _runtime_q()
+        root_after = _runtime_root()
+
+        joint_delta: Optional[float] = None
+        if (
+            q_before is not None
+            and q_after is not None
+            and len(q_before) == len(q_after)
+        ):
+            joint_delta = max(
+                (abs(a - b) for a, b in zip(q_before, q_after)), default=0.0
+            )
+        root_delta: Optional[float] = None
+        if root_before is not None and root_after is not None:
+            root_delta = max(abs(a - b) for a, b in zip(root_before, root_after))
+
+        advanced = bool(
+            (joint_delta is not None and joint_delta > position_tol)
+            or (root_delta is not None and root_delta > position_tol)
+        )
+        return {
+            "prim_path": prim_path,
+            "advanced": advanced,
+            "steps": stepped,
+            "max_joint_delta": joint_delta,
+            "max_root_delta": root_delta,
+            "source": "physx_runtime",
+        }
+
     # ── Physics ────────────────────────────────────────────
 
     def create_world(self, **kwargs) -> Any:
@@ -804,14 +1272,129 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 result["linear_velocity"] = [0.0, 0.0, 0.0]
                 result["angular_velocity"] = [0.0, 0.0, 0.0]
 
-        # Get contact info if available
+        # Contact reaction forces from the PhysX contact-report buffer (runtime
+        # physics state, not authored USD). Nonempty on impact — e.g. a foot
+        # striking the ground reports a nonzero contact impulse; [] otherwise.
         try:
-            contacts = []
-            result["contacts"] = contacts
+            result["contacts"] = self._read_contact_forces(prim_path)
         except Exception:
             result["contacts"] = []
 
         return result
+
+    def ensure_contact_reporting(self, prim_path: str) -> None:
+        """Public spawn / pre-play entry point (overrides base). The extension
+        calls this at robot spawn — via robots.create — rather than lazily in
+        the get_physics_state read path, so PhysxContactReportAPI is authored
+        before the scene goes live and foot-ground reaction forces fire on the
+        first impact instead of being dropped by PhysX until a re-parse.
+        """
+        self._ensure_contact_reporting(prim_path)
+
+    def _ensure_contact_reporting(self, prim_path: str) -> None:
+        """Apply PhysxContactReportAPI to rigid bodies under prim_path so PhysX
+        emits contact reports for them. Idempotent; safe to call repeatedly.
+
+        TODO(probe:contacts): whether applying this on an already-playing sim
+        takes effect without a physics re-parse is runtime-unconfirmed — hence
+        it is authored at spawn (pre-play) via ensure_contact_reporting, not in
+        the read path, for guaranteed reporting.
+        """
+        from pxr import PhysxSchema, Usd, UsdPhysics
+
+        stage = self.get_stage()
+        root_prim = stage.GetPrimAtPath(prim_path)
+        if not root_prim.IsValid():
+            return
+        for desc in Usd.PrimRange(root_prim):
+            if not desc.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            if desc.HasAPI(PhysxSchema.PhysxContactReportAPI):
+                continue
+            api = PhysxSchema.PhysxContactReportAPI.Apply(desc)
+            # threshold 0 -> report every contact (foot-ground impacts included).
+            api.CreateThresholdAttr(0.0)
+
+    def _read_contact_forces(self, prim_path: str) -> List[Dict[str, Any]]:
+        """Read PhysX contact reports whose collider subtree touches prim_path.
+
+        Uses the PhysX simulation contact-report buffer (RUNTIME physics state,
+        never authored USD). Foot-ground reaction forces appear here as nonzero
+        contact impulses; returns [] when nothing is in contact (or sim stopped).
+
+        TODO(probe:contacts): the contact-report struct field names and impulse
+        units (impulse [N·s] vs force = impulse/dt) are runtime-unconfirmed on
+        6.0.0-rc.22; reported values are passed through as PhysX supplies them.
+        """
+        contacts: List[Dict[str, Any]] = []
+        try:
+            import omni.physx
+            from pxr import PhysicsSchemaTools
+        except Exception:
+            return contacts
+
+        # NB: contact reporting is authored at SPAWN (ensure_contact_reporting),
+        # NOT here. Applying it lazily in this read path is too late once the
+        # scene is live (PhysX will not re-parse), so it would silently miss the
+        # first-impact forces. This reader only consumes the real PhysX buffer.
+        try:
+            sim = omni.physx.get_physx_simulation_interface()
+            contact_headers, contact_data = sim.get_contact_report()
+        except Exception:
+            return contacts
+
+        def _decode(encoded: Any) -> str:
+            try:
+                return str(PhysicsSchemaTools.intToSdfPath(encoded))
+            except Exception:
+                return ""
+
+        def _vec3(v: Any) -> List[float]:
+            try:
+                return [float(v[0]), float(v[1]), float(v[2])]
+            except Exception:
+                try:
+                    return [float(v.x), float(v.y), float(v.z)]
+                except Exception:
+                    return [0.0, 0.0, 0.0]
+
+        for header in contact_headers or []:
+            body0 = _decode(getattr(header, "collider0", getattr(header, "actor0", 0)))
+            body1 = _decode(getattr(header, "collider1", getattr(header, "actor1", 0)))
+            if prim_path not in body0 and prim_path not in body1:
+                continue
+            offset = int(getattr(header, "contact_data_offset", 0) or 0)
+            count = int(getattr(header, "num_contact_data", 0) or 0)
+            total = [0.0, 0.0, 0.0]
+            points: List[Dict[str, Any]] = []
+            for i in range(offset, offset + count):
+                if i < 0 or i >= len(contact_data):
+                    break
+                cd = contact_data[i]
+                impulse = _vec3(getattr(cd, "impulse", (0.0, 0.0, 0.0)))
+                total = [
+                    total[0] + impulse[0],
+                    total[1] + impulse[1],
+                    total[2] + impulse[2],
+                ]
+                points.append(
+                    {
+                        "position": _vec3(getattr(cd, "position", (0.0, 0.0, 0.0))),
+                        "normal": _vec3(getattr(cd, "normal", (0.0, 0.0, 0.0))),
+                        "impulse": impulse,
+                        "separation": float(getattr(cd, "separation", 0.0) or 0.0),
+                    }
+                )
+            contacts.append(
+                {
+                    "body0": body0,
+                    "body1": body1,
+                    "num_points": count,
+                    "total_impulse": total,
+                    "points": points,
+                }
+            )
+        return contacts
 
     # ── Sensors ────────────────────────────────────────────
 
@@ -1238,7 +1821,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
         stage = self.get_stage()
         physics_dt = 1.0 / 60.0  # default
         for prim in stage.Traverse():
-            if prim.HasAPI(UsdPhysics.Scene):
+            # UsdPhysics.Scene is a typed (IsA) schema, not an applied-API
+            # schema: HasAPI(Scene) is always False, so the old check never
+            # found the scene and always returned the 1/60 default — making the
+            # autospawn physics_dt==1/200 verification a lie. IsA is correct.
+            if prim.IsA(UsdPhysics.Scene):
                 time_step_attr = prim.GetAttribute("physxScene:timeStepsPerSecond")
                 if time_step_attr and time_step_attr.Get():
                     steps_per_sec = time_step_attr.Get()
