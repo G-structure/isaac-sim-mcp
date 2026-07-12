@@ -116,6 +116,23 @@ def test_v5_adapter_implements_all_methods():
     assert not missing, f"v5 adapter missing implementations: {missing}"
 
 
+def test_v5_adapter_owns_initialized_camera_lifecycle():
+    """Camera capture must reuse an initialized sensor without re-entering Kit."""
+    path = os.path.join(EXTENSION_ROOT, "adapters", "v5.py")
+    with open(path) as handle:
+        source = handle.read()
+
+    assert "self._camera_cache: Dict[str, Any] = {}" in source
+    assert "camera.initialize()" in source
+    assert "self._camera_cache[prim_path] = camera" in source
+    capture_source = source.split("    def capture_camera_image", 1)[1].split(
+        "    def create_lidar", 1
+    )[0]
+    assert "omni.kit.app.get_app().update()" not in capture_source
+    assert "produced no rendered frame" in source
+    assert "self._camera_cache.clear()" in source
+
+
 def test_all_handler_modules_have_register():
     """Verify every handler module exposes a register(registry, adapter) function."""
     handlers_dir = os.path.join(EXTENSION_ROOT, "handlers")
