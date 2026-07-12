@@ -133,6 +133,18 @@ def test_v5_adapter_owns_initialized_camera_lifecycle():
     assert "self._camera_cache.clear()" in source
 
 
+def test_camera_capture_creates_artifact_parent_directory():
+    """Artifact-first capture must work in a fresh workspace."""
+    path = os.path.join(EXTENSION_ROOT, "handlers", "sensors.py")
+    with open(path) as handle:
+        source = handle.read()
+
+    capture_source = source.split("def capture_image", 1)[1].split(
+        "def create_lidar", 1
+    )[0]
+    assert "Path(output_path).parent.mkdir(parents=True, exist_ok=True)" in capture_source
+
+
 def test_all_handler_modules_have_register():
     """Verify every handler module exposes a register(registry, adapter) function."""
     handlers_dir = os.path.join(EXTENSION_ROOT, "handlers")
