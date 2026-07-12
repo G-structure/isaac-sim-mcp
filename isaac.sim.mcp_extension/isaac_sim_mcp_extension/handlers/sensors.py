@@ -60,8 +60,11 @@ def capture_image(
     try:
         image_data = adapter.capture_camera_image(prim_path)
         if output_path:
+            from pathlib import Path
+
             from PIL import Image
 
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             img = Image.fromarray(image_data)
             img.save(output_path)
             return {"status": "success", "message": f"Image saved to {output_path}", "output_path": output_path}
