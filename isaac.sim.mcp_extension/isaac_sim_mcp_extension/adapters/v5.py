@@ -45,6 +45,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def __init__(self) -> None:
         self._articulation_cache: Dict[str, Any] = {}
         self._joint_name_cache: Dict[str, List[str]] = {}
+        self._camera_cache: Dict[str, Any] = {}
 
     # ── Scene ──────────────────────────────────────────────
 
@@ -820,13 +821,23 @@ class IsaacAdapterV5(IsaacAdapterBase):
     ) -> Any:
         from isaacsim.sensors.camera import Camera
 
-        return Camera(prim_path=prim_path, resolution=resolution, **kwargs)
+        camera = Camera(prim_path=prim_path, resolution=resolution, **kwargs)
+        camera.initialize()
+        self._camera_cache[prim_path] = camera
+        return camera
 
     def capture_camera_image(self, prim_path: str) -> np.ndarray:
         from isaacsim.sensors.camera import Camera
 
-        cam = Camera(prim_path=prim_path)
-        return cam.get_rgba()
+        camera = self._camera_cache.get(prim_path)
+        if camera is None:
+            camera = Camera(prim_path=prim_path)
+            camera.initialize()
+            self._camera_cache[prim_path] = camera
+        image = camera.get_rgba()
+        if image is None:
+            raise RuntimeError(f"Camera {prim_path} produced no rendered frame")
+        return np.asarray(image)
 
     def create_lidar(
         self, prim_path: str, config: Optional[str] = None, **kwargs
@@ -1014,6 +1025,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         omni.timeline.get_timeline_interface().stop()
         self._articulation_cache.clear()
         self._joint_name_cache.clear()
+        self._camera_cache.clear()
 
     def ping(self) -> Dict[str, Any]:
         import omni.usd
