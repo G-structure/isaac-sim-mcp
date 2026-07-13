@@ -25,14 +25,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import queue
 import socket
 import threading
 import time
 import traceback
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from typing import Any, Callable, Dict
+
+
+@dataclass(eq=False)
+class _PendingCommand:
+    command: Dict[str, Any]
+    future: Future[Dict[str, Any]]
+    started: bool = False
 
 
 class SocketServer:
@@ -62,65 +70,164 @@ class SocketServer:
         self.running: bool = False
         self._socket: socket.socket | None = None
         self._server_thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    def set_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
-        """Bind the Kit main asyncio loop used to run command handlers.
-
-        Must be the loop that runs on Isaac's main thread (captured in
-        ``on_startup``). Commands touch USD/stage/timeline APIs that are
-        main-thread only, so the socket worker threads marshal onto this loop.
-        """
-        self._loop = loop
+        self._lifecycle_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._pending_commands: queue.Queue[_PendingCommand] = queue.Queue()
+        self._outstanding_commands: set[_PendingCommand] = set()
+        self._drain_lock = threading.Lock()
+        self._clients_lock = threading.Lock()
+        self._clients: set[socket.socket] = set()
+        self._client_threads: set[threading.Thread] = set()
+        self._dispatch_condition = threading.Condition()
+        self._active_dispatches = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         """Bind the socket and start the background accept loop."""
-        if self.running:
-            return
-        self.running = True
-        try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.bind((self.host, self.port))
-            self._socket.listen(1)
-            self._server_thread = threading.Thread(target=self._server_loop, daemon=True)
-            self._server_thread.start()
-            print(f"Isaac Sim MCP server started on {self.host}:{self.port}")
-        except Exception as e:
-            print(f"Failed to start server: {e}")
-            self.stop()
+        with self._lifecycle_lock:
+            if self._is_running():
+                return
+
+            server_socket: socket.socket | None = None
+            try:
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind((self.host, self.port))
+                server_socket.listen(1)
+                server_socket.settimeout(0.1)
+
+                with self._state_lock:
+                    self.running = True
+                    self._socket = server_socket
+
+                self._server_thread = threading.Thread(
+                    target=self._server_loop,
+                    args=(server_socket,),
+                    daemon=True,
+                )
+                self._server_thread.start()
+                print(f"Isaac Sim MCP server started on {self.host}:{self.port}")
+            except Exception as e:
+                if server_socket is not None:
+                    self._close_socket(server_socket)
+                with self._state_lock:
+                    self.running = False
+                    self._socket = None
+                print(f"Failed to start server: {e}")
 
     def stop(self) -> None:
-        """Signal the server to stop and close the socket."""
-        self.running = False
-        if self._socket:
-            try:
-                self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
-        if self._server_thread and self._server_thread.is_alive():
-            self._server_thread.join(timeout=1.0)
-        self._server_thread = None
-        print("Isaac Sim MCP server stopped")
+        """Stop accepting work, resolve pending commands, and join workers."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self.running = False
+                server_socket = self._socket
+                self._socket = None
+
+            if server_socket is not None:
+                self._close_socket(server_socket)
+
+            self._resolve_outstanding(
+                {
+                    "status": "error",
+                    "message": "Isaac MCP server stopped before command completed",
+                }
+            )
+            self._discard_queued_commands()
+
+            server_thread = self._server_thread
+            if (
+                server_thread is not None
+                and server_thread is not threading.current_thread()
+            ):
+                server_thread.join(timeout=1.0)
+            self._server_thread = None
+
+            self._wait_for_active_dispatches(timeout=1.0)
+            with self._clients_lock:
+                clients = list(self._clients)
+                client_threads = list(self._client_threads)
+
+            for client in clients:
+                self._close_socket(client)
+
+            deadline = time.monotonic() + 1.0
+            for thread in client_threads:
+                if thread is threading.current_thread():
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=remaining)
+
+            print("Isaac Sim MCP server stopped")
+
+    def drain_pending_commands(self) -> int:
+        """Execute queued commands on the calling thread.
+
+        The retained Kit update-event callback is the production caller. A
+        non-blocking guard prevents a handler-triggered nested update from
+        recursively draining the queue.
+        """
+        if not self._drain_lock.acquire(blocking=False):
+            return 0
+
+        executed = 0
+        try:
+            while True:
+                try:
+                    pending = self._pending_commands.get_nowait()
+                except queue.Empty:
+                    break
+
+                with self._state_lock:
+                    if pending not in self._outstanding_commands or not self.running:
+                        continue
+                    pending.started = True
+
+                try:
+                    response = self._command_handler(pending.command)
+                except Exception as e:
+                    traceback.print_exc()
+                    response = {"status": "error", "message": str(e)}
+
+                with self._state_lock:
+                    if pending in self._outstanding_commands:
+                        self._outstanding_commands.remove(pending)
+                        pending.future.set_result(response)
+                executed += 1
+        finally:
+            self._drain_lock.release()
+
+        return executed
 
     # ── Connection handling ────────────────────────────────────────────────────
 
-    def _server_loop(self) -> None:
-        self._socket.settimeout(1.0)
-        while self.running:
+    def _server_loop(self, server_socket: socket.socket) -> None:
+        while self._is_running():
             try:
-                client, address = self._socket.accept()
+                client, address = server_socket.accept()
                 print(f"Connected to client: {address}")
-                threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+                self._start_client_thread(client)
             except socket.timeout:
                 continue
             except Exception as e:
-                if self.running:
+                if self._is_running():
                     print(f"Error accepting connection: {e}")
                     time.sleep(0.5)
+
+    def _start_client_thread(self, client: socket.socket) -> None:
+        thread = threading.Thread(
+            target=self._handle_client, args=(client,), daemon=True
+        )
+        with self._state_lock:
+            if not self.running:
+                self._close_socket(client)
+                return
+            with self._clients_lock:
+                self._clients.add(client)
+                self._client_threads.add(thread)
+                thread.start()
 
     def _handle_client(self, client: socket.socket) -> None:
         client.settimeout(None)
@@ -138,44 +245,105 @@ class SocketServer:
                 except json.JSONDecodeError:
                     continue
         except Exception as e:
-            print(f"Error in client handler: {e}")
+            if self._is_running():
+                print(f"Error in client handler: {e}")
         finally:
-            client.close()
+            self._close_socket(client)
+            with self._clients_lock:
+                self._clients.discard(client)
+                self._client_threads.discard(threading.current_thread())
 
     def _dispatch_command(self, client: socket.socket, command: Dict[str, Any]) -> None:
-        # This runs on a per-client worker thread. Omniverse USD/stage/timeline
-        # APIs invoked by the handler are main-thread only, so the call is
-        # marshalled onto the Kit asyncio loop with run_coroutine_threadsafe —
-        # the *thread-safe* scheduler that also wakes the loop. (Calling
-        # omni.kit.async_engine.run_coroutine() directly from this worker thread
-        # enqueued the coroutine without a thread-safe wakeup, so it was never
-        # pumped and every command — including simulation.ping — timed out,
-        # which kept the bridge from ever registering.)
-        response = self._run_command_on_main_loop(command)
+        if not self._begin_dispatch():
+            return
         try:
-            client.sendall(json.dumps(response).encode("utf-8"))
-        except Exception:
-            print("Failed to send response — client disconnected")
+            response = self._wait_for_main_thread(command)
+            try:
+                client.sendall(json.dumps(response).encode("utf-8"))
+            except Exception:
+                print("Failed to send response - client disconnected")
+        finally:
+            self._finish_dispatch()
 
-    def _run_command_on_main_loop(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        loop = self._loop
-        if loop is None or not loop.is_running():
-            # Loop not captured yet (briefly, right after on_startup) or shutting
-            # down. Return an error so the socket stays responsive and the client
-            # retries, rather than blocking this worker thread indefinitely.
-            return {"status": "error", "message": "Isaac main loop not ready"}
-
-        async def _call() -> Dict[str, Any]:
-            return self._command_handler(command)
+    def _wait_for_main_thread(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        pending = _PendingCommand(command=command, future=Future())
+        with self._state_lock:
+            if not self.running:
+                return {"status": "error", "message": "Isaac MCP server is stopping"}
+            self._outstanding_commands.add(pending)
+            self._pending_commands.put(pending)
 
         try:
-            future = asyncio.run_coroutine_threadsafe(_call(), loop)
-            return future.result(timeout=self._command_timeout)
+            return pending.future.result(timeout=self._command_timeout)
         except FutureTimeoutError:
+            with self._state_lock:
+                if pending not in self._outstanding_commands:
+                    return pending.future.result()
+                self._outstanding_commands.remove(pending)
+                pending.future.cancel()
+                started = pending.started
+
+            wait_target = (
+                "command execution on the Isaac main thread"
+                if started
+                else "the Isaac main-thread update pump"
+            )
             return {
                 "status": "error",
-                "message": f"Command timed out after {self._command_timeout}s on Isaac main loop",
+                "message": f"Command timed out after {self._command_timeout:g}s waiting for {wait_target}",
             }
         except Exception as e:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
+
+    def _resolve_outstanding(self, response: Dict[str, Any]) -> None:
+        with self._state_lock:
+            pending_commands = list(self._outstanding_commands)
+            self._outstanding_commands.clear()
+            for pending in pending_commands:
+                if not pending.future.done():
+                    pending.future.set_result(dict(response))
+
+    def _discard_queued_commands(self) -> None:
+        while True:
+            try:
+                self._pending_commands.get_nowait()
+            except queue.Empty:
+                return
+
+    def _begin_dispatch(self) -> bool:
+        with self._state_lock:
+            if not self.running:
+                return False
+            with self._dispatch_condition:
+                self._active_dispatches += 1
+            return True
+
+    def _finish_dispatch(self) -> None:
+        with self._dispatch_condition:
+            self._active_dispatches -= 1
+            self._dispatch_condition.notify_all()
+
+    def _wait_for_active_dispatches(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        with self._dispatch_condition:
+            while self._active_dispatches:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._dispatch_condition.wait(timeout=remaining)
+
+    def _is_running(self) -> bool:
+        with self._state_lock:
+            return self.running
+
+    @staticmethod
+    def _close_socket(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass

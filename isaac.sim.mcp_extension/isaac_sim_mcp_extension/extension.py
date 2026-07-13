@@ -51,6 +51,7 @@ class MCPExtension(omni.ext.IExt):
         self._registry: Dict[str, Any] = {}
         self._adapter = None
         self._server: SocketServer | None = None
+        self._update_subscription: Any = None
 
     def on_startup(self, ext_id: str) -> None:
         print("trigger  on_startup for: ", ext_id)
@@ -74,13 +75,14 @@ class MCPExtension(omni.ext.IExt):
         print(f"Registered {len(self._registry)} command handlers")
 
         self._server = SocketServer(host, port, self._execute_command)
+        update_stream = omni.kit.app.get_app().get_update_event_stream()
+        self._update_subscription = update_stream.create_subscription_to_pop(
+            self._on_update,
+            name=f"{ext_id} socket command pump",
+        )
+        # Retain the update subscription before accepting sockets. Its callback
+        # is Kit-owned main-thread execution; socket workers only enqueue and wait.
         self._server.start()
-        # Commands run Omniverse APIs that are main-thread only. The socket server
-        # accepts connections on worker threads, so it needs the Kit main asyncio
-        # loop to marshal calls onto. Capture it on the main thread (here) via a
-        # one-shot coroutine: run_coroutine is safe to call from the main thread,
-        # and get_running_loop() inside it returns the actual Kit loop.
-        self._bind_main_loop()
         # NOTE: workspace stage persistence is owned EXCLUSIVELY by warm_slot_agent
         # (save_open_stage), which saves the open root layer IN PLACE and coordinates
         # with the S3 sync daemon. The extension intentionally does NOT autosave: a
@@ -89,21 +91,18 @@ class MCPExtension(omni.ext.IExt):
         # flatten, stacked overlapping exports, and swallowed coroutine-body errors.
         # See issue "two-writers-open-root".
 
-    def _bind_main_loop(self) -> None:
-        import asyncio
-
-        from omni.kit.async_engine import run_coroutine
-
-        async def _bind() -> None:
-            if self._server is not None:
-                self._server.set_loop(asyncio.get_running_loop())
-
-        run_coroutine(_bind())
+    def _on_update(self, _event: Any) -> None:
+        server = self._server
+        if server is not None:
+            server.drain_pending_commands()
 
     def on_shutdown(self) -> None:
         print("trigger  on_shutdown for: ", self.ext_id)
-        if self._server:
-            self._server.stop()
+        self._update_subscription = None
+        server = self._server
+        self._server = None
+        if server:
+            server.stop()
         self._registry.clear()
         gc.collect()
 
@@ -123,7 +122,9 @@ class MCPExtension(omni.ext.IExt):
             }
         )
 
-    def _legacy_omni_kit_command(self, command: str = "CreatePrim", prim_type: str = "Sphere") -> Dict[str, Any]:
+    def _legacy_omni_kit_command(
+        self, command: str = "CreatePrim", prim_type: str = "Sphere"
+    ) -> Dict[str, Any]:
         omni.kit.commands.execute(command, prim_type=prim_type)
         return {"status": "success", "message": "command executed"}
 
@@ -171,7 +172,9 @@ class MCPExtension(omni.ext.IExt):
 
         for index, obj in enumerate(objects or []):
             obj_type = obj.get("type", "Cube")
-            prim_path = obj.get("path") or f"/World/{obj.get('name', f'object_{index}')}"
+            prim_path = (
+                obj.get("path") or f"/World/{obj.get('name', f'object_{index}')}"
+            )
             rotation = obj.get("rotation")
             if isinstance(rotation, list) and len(rotation) == 4:
                 rotation = None
@@ -208,7 +211,9 @@ class MCPExtension(omni.ext.IExt):
                 else:
                     return {
                         "status": "error",
-                        "message": result.get("message", "Unknown error") if result else "No result",
+                        "message": result.get("message", "Unknown error")
+                        if result
+                        else "No result",
                     }
             except Exception as e:
                 traceback.print_exc()
