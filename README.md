@@ -167,6 +167,26 @@ The Isaac Sim MCP Extension provides several specialized tools that can be acces
 - **execute_script** - Executes arbitrary Python code in Isaac Sim:
   - `code`: Python code to execute
 
+### Camera Sensors
+
+- **create_camera** - Creates or replaces an initialized RGB camera:
+  - `prim_path`: Camera USD prim path
+  - `position`: Optional `[x, y, z]` translation
+  - `rotation`: Optional XYZ Euler degrees
+  - `orientation`: Optional quaternion `[w, x, y, z]`, mutually exclusive with `rotation`
+  - `resolution`: Optional `[width, height]`
+  - `focal_length`, `focus_distance`: Optional positive projection values
+  - `horizontal_aperture`, `vertical_aperture`: Optional positive sensor apertures
+  - `clipping_range`: Optional `[near, far]` where `0 < near < far`
+- **set_active_camera** - Selects a camera prim for the active streamed viewport
+  without changing the sensor pose, projection, or captured observations.
+- **capture_image** - Captures RGB from an initialized camera, optionally to an artifact path.
+
+Camera pose and projection attributes are authored before the runtime render
+product initializes. Replacing a camera or deleting its prim destroys the
+cached wrapper first, preventing stale render products from returning blank or
+clipped frames.
+
 ### Usage Best Practices
 
 1. Always check connection with `get_scene_info` before executing any commands

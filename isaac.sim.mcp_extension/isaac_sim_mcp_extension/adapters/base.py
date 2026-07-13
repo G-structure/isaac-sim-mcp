@@ -66,7 +66,9 @@ class IsaacAdapterBase(ABC):
     # ── Prims ──────────────────────────────────────────────
 
     @abstractmethod
-    def create_prim(self, prim_path: str, prim_type: str = "Xform", **kwargs) -> Usd.Prim:
+    def create_prim(
+        self, prim_path: str, prim_type: str = "Xform", **kwargs
+    ) -> Usd.Prim:
         """Create a USD prim at the given path."""
         ...
 
@@ -86,9 +88,10 @@ class IsaacAdapterBase(ABC):
         prim_path: str,
         position: Optional[Sequence[float]] = None,
         rotation: Optional[Sequence[float]] = None,
+        orientation: Optional[Sequence[float]] = None,
         scale: Optional[Sequence[float]] = None,
     ) -> None:
-        """Set position, rotation, and/or scale on a prim."""
+        """Set position, Euler rotation, quaternion orientation, and/or scale."""
         ...
 
     @abstractmethod
@@ -97,7 +100,9 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def list_prims(self, root_path: str = "/", prim_type: Optional[str] = None) -> List[Dict[str, str]]:
+    def list_prims(
+        self, root_path: str = "/", prim_type: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         """List prims under root_path, optionally filtered by type."""
         ...
 
@@ -107,7 +112,9 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def get_prim_actual_size(self, prim_path: str) -> Tuple[List[float], Tuple[List[float], List[float]]]:
+    def get_prim_actual_size(
+        self, prim_path: str
+    ) -> Tuple[List[float], Tuple[List[float], List[float]]]:
         """Return actual dimensions and bounding box for a geometric prim.
 
         Returns:
@@ -153,7 +160,10 @@ class IsaacAdapterBase(ABC):
 
     @abstractmethod
     def set_joint_positions(
-        self, prim_path: str, positions: Sequence[float], joint_indices: Optional[List[int]] = None
+        self,
+        prim_path: str,
+        positions: Sequence[float],
+        joint_indices: Optional[List[int]] = None,
     ) -> None:
         """Set target joint positions on a robot articulation."""
         ...
@@ -181,7 +191,11 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def create_physics_scene(self, gravity: Optional[Sequence[float]] = None, scene_name: str = "PhysicsScene") -> str:
+    def create_physics_scene(
+        self,
+        gravity: Optional[Sequence[float]] = None,
+        scene_name: str = "PhysicsScene",
+    ) -> str:
         """Create a physics scene prim with gravity settings."""
         ...
 
@@ -193,8 +207,25 @@ class IsaacAdapterBase(ABC):
     # ── Sensors ────────────────────────────────────────────
 
     @abstractmethod
-    def create_camera(self, prim_path: str, resolution: Tuple[int, int] = (1280, 720), **kwargs) -> Any:
-        """Create a camera sensor at prim_path."""
+    def create_camera(
+        self,
+        prim_path: str,
+        resolution: Tuple[int, int] = (1280, 720),
+        position: Optional[Sequence[float]] = None,
+        rotation: Optional[Sequence[float]] = None,
+        orientation: Optional[Sequence[float]] = None,
+        focal_length: Optional[float] = None,
+        focus_distance: Optional[float] = None,
+        horizontal_aperture: Optional[float] = None,
+        vertical_aperture: Optional[float] = None,
+        clipping_range: Optional[Sequence[float]] = None,
+    ) -> Any:
+        """Create and initialize a fully configured camera sensor."""
+        ...
+
+    @abstractmethod
+    def set_active_camera(self, prim_path: str) -> Dict[str, Any]:
+        """Select a camera prim for the active interactive viewport."""
         ...
 
     @abstractmethod
@@ -203,7 +234,9 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def create_lidar(self, prim_path: str, config: Optional[str] = None, **kwargs) -> Any:
+    def create_lidar(
+        self, prim_path: str, config: Optional[str] = None, **kwargs
+    ) -> Any:
         """Create a lidar sensor at prim_path."""
         ...
 
@@ -257,7 +290,10 @@ class IsaacAdapterBase(ABC):
 
     @abstractmethod
     def modify_light(
-        self, prim_path: str, intensity: Optional[float] = None, color: Optional[Sequence[float]] = None
+        self,
+        prim_path: str,
+        intensity: Optional[float] = None,
+        color: Optional[Sequence[float]] = None,
     ) -> None:
         """Modify properties of an existing light."""
         ...
@@ -270,7 +306,9 @@ class IsaacAdapterBase(ABC):
     # ── Assets ─────────────────────────────────────────────
 
     @abstractmethod
-    def import_urdf(self, urdf_path: str, prim_path: str = "/World/robot", **kwargs) -> Any:
+    def import_urdf(
+        self, urdf_path: str, prim_path: str = "/World/robot", **kwargs
+    ) -> Any:
         """Import a robot from a URDF file."""
         ...
 
@@ -351,7 +389,9 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def reload_script(self, file_path: str, module_name: Optional[str] = None) -> Dict[str, Any]:
+    def reload_script(
+        self, file_path: str, module_name: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Reload a Python script or module into the Isaac Sim runtime.
 
         Args:

@@ -32,14 +32,22 @@ if TYPE_CHECKING:
     from isaac_mcp.connection import IsaacConnection
 
 
-def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]") -> None:
+def register_tools(
+    mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
+) -> None:
 
     @mcp.tool("create_camera")
     def create_camera(
         prim_path: str = "/World/Camera",
         position: Optional[List[float]] = None,
         rotation: Optional[List[float]] = None,
+        orientation: Optional[List[float]] = None,
         resolution: Optional[List[int]] = None,
+        focal_length: Optional[float] = None,
+        focus_distance: Optional[float] = None,
+        horizontal_aperture: Optional[float] = None,
+        vertical_aperture: Optional[float] = None,
+        clipping_range: Optional[List[float]] = None,
     ) -> str:
         """Add a camera sensor to the scene.
 
@@ -47,24 +55,44 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             prim_path: Prim path for the camera.
             position: [x, y, z] world position.
             rotation: [rx, ry, rz] rotation in degrees.
+            orientation: [w, x, y, z] quaternion. Mutually exclusive with rotation.
             resolution: [width, height] image resolution. Default 1280x720.
+            focal_length: Perspective focal length in stage camera units.
+            focus_distance: Distance to the focus plane.
+            horizontal_aperture: Horizontal sensor aperture.
+            vertical_aperture: Vertical sensor aperture.
+            clipping_range: [near, far] clipping distances in stage units.
         """
         try:
             conn = get_connection()
             params = {"prim_path": prim_path}
-            if position:
+            if position is not None:
                 params["position"] = position
-            if rotation:
+            if rotation is not None:
                 params["rotation"] = rotation
-            if resolution:
+            if orientation is not None:
+                params["orientation"] = orientation
+            if resolution is not None:
                 params["resolution"] = resolution
+            if focal_length is not None:
+                params["focal_length"] = focal_length
+            if focus_distance is not None:
+                params["focus_distance"] = focus_distance
+            if horizontal_aperture is not None:
+                params["horizontal_aperture"] = horizontal_aperture
+            if vertical_aperture is not None:
+                params["vertical_aperture"] = vertical_aperture
+            if clipping_range is not None:
+                params["clipping_range"] = clipping_range
             result = conn.send_command("sensors.create_camera", params)
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool("capture_image")
-    def capture_image(prim_path: str = "/World/Camera", output_path: Optional[str] = None) -> str:
+    def capture_image(
+        prim_path: str = "/World/Camera", output_path: Optional[str] = None
+    ) -> str:
         """Capture an RGB image from a camera sensor.
 
         Args:
@@ -77,6 +105,22 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             if output_path:
                 params["output_path"] = output_path
             result = conn.send_command("sensors.capture_image", params)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    @mcp.tool("set_active_camera")
+    def set_active_camera(prim_path: str = "/World/Camera") -> str:
+        """Select a camera for the active interactive viewport.
+
+        This changes the streamed viewer framing without changing any sensor's
+        pose, optics, or captured observations.
+        """
+        try:
+            conn = get_connection()
+            result = conn.send_command(
+                "sensors.set_active_camera", {"prim_path": prim_path}
+            )
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
@@ -119,7 +163,9 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
         """
         try:
             conn = get_connection()
-            result = conn.send_command("sensors.get_point_cloud", {"prim_path": prim_path})
+            result = conn.send_command(
+                "sensors.get_point_cloud", {"prim_path": prim_path}
+            )
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})

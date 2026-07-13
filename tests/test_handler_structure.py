@@ -26,7 +26,12 @@
 import ast
 import os
 
-EXTENSION_ROOT = os.path.join(os.path.dirname(__file__), "..", "isaac.sim.mcp_extension", "isaac_sim_mcp_extension")
+EXTENSION_ROOT = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "isaac.sim.mcp_extension",
+    "isaac_sim_mcp_extension",
+)
 
 
 def _parse_file(path):
@@ -43,7 +48,10 @@ def test_adapter_base_has_all_abstract_methods():
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Name) and decorator.id == "abstractmethod":
                     methods.add(node.name)
-                elif isinstance(decorator, ast.Attribute) and decorator.attr == "abstractmethod":
+                elif (
+                    isinstance(decorator, ast.Attribute)
+                    and decorator.attr == "abstractmethod"
+                ):
                     methods.add(node.name)
     expected = {
         "get_stage",
@@ -67,6 +75,7 @@ def test_adapter_base_has_all_abstract_methods():
         "create_simulation_context",
         "create_physics_scene",
         "create_camera",
+        "set_active_camera",
         "capture_camera_image",
         "create_lidar",
         "get_lidar_point_cloud",
@@ -90,7 +99,9 @@ def test_adapter_base_has_all_abstract_methods():
         # Dimensional data (issue #2)
         "get_prim_actual_size",
     }
-    assert methods == expected, f"Missing: {expected - methods}, Extra: {methods - expected}"
+    assert methods == expected, (
+        f"Missing: {expected - methods}, Extra: {methods - expected}"
+    )
 
 
 def test_v5_adapter_implements_all_methods():
@@ -102,8 +113,11 @@ def test_v5_adapter_implements_all_methods():
     for node in ast.walk(base_tree):
         if isinstance(node, ast.FunctionDef) and node.name != "__init__":
             for decorator in node.decorator_list:
-                if (isinstance(decorator, ast.Name) and decorator.id == "abstractmethod") or (
-                    isinstance(decorator, ast.Attribute) and decorator.attr == "abstractmethod"
+                if (
+                    isinstance(decorator, ast.Name) and decorator.id == "abstractmethod"
+                ) or (
+                    isinstance(decorator, ast.Attribute)
+                    and decorator.attr == "abstractmethod"
                 ):
                     base_methods.add(node.name)
 
@@ -125,12 +139,36 @@ def test_v5_adapter_owns_initialized_camera_lifecycle():
     assert "self._camera_cache: Dict[str, Any] = {}" in source
     assert "camera.initialize()" in source
     assert "self._camera_cache[prim_path] = camera" in source
+    assert "self._release_cached_cameras(prim_path)" in source
+    assert "camera.destroy()" in source
     capture_source = source.split("    def capture_camera_image", 1)[1].split(
         "    def create_lidar", 1
     )[0]
     assert "omni.kit.app.get_app().update()" not in capture_source
     assert "produced no rendered frame" in source
-    assert "self._camera_cache.clear()" in source
+    assert "self._release_cached_cameras()" in source
+
+
+def test_v5_camera_is_configured_before_runtime_initialization():
+    path = os.path.join(EXTENSION_ROOT, "adapters", "v5.py")
+    with open(path) as handle:
+        source = handle.read()
+
+    create_source = source.split("    def create_camera", 1)[1].split(
+        "    def capture_camera_image", 1
+    )[0]
+    assert create_source.index("UsdGeom.Camera.Define") < create_source.index(
+        "camera.initialize()"
+    )
+    assert create_source.index("GetClippingRangeAttr") < create_source.index(
+        "camera.initialize()"
+    )
+    delete_source = source.split("    def delete_prim", 1)[1].split(
+        "    def discover_environments", 1
+    )[0]
+    assert delete_source.index("self._release_cached_cameras") < delete_source.index(
+        'omni.kit.commands.execute("DeletePrims"'
+    )
 
 
 def test_camera_capture_creates_artifact_parent_directory():
@@ -142,7 +180,9 @@ def test_camera_capture_creates_artifact_parent_directory():
     capture_source = source.split("def capture_image", 1)[1].split(
         "def create_lidar", 1
     )[0]
-    assert "Path(output_path).parent.mkdir(parents=True, exist_ok=True)" in capture_source
+    assert (
+        "Path(output_path).parent.mkdir(parents=True, exist_ok=True)" in capture_source
+    )
 
 
 def test_all_handler_modules_have_register():
@@ -162,5 +202,7 @@ def test_all_handler_modules_have_register():
         filepath = os.path.join(handlers_dir, filename)
         assert os.path.exists(filepath), f"Handler file missing: {filename}"
         tree = _parse_file(filepath)
-        func_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+        func_names = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
         assert "register" in func_names, f"{filename} missing register() function"
