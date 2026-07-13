@@ -71,8 +71,25 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def delete_prim(self, prim_path: str) -> bool:
         import omni.kit.commands
 
+        self._release_cached_cameras(prim_path)
         omni.kit.commands.execute("DeletePrims", paths=[prim_path])
         return True
+
+    def _release_cached_cameras(self, prim_path: Optional[str] = None) -> None:
+        paths = [
+            path
+            for path in self._camera_cache
+            if prim_path is None
+            or path == prim_path
+            or path.startswith(f"{prim_path}/")
+        ]
+        for path in paths:
+            camera = self._camera_cache.pop(path)
+            try:
+                camera.destroy()
+            except Exception:
+                # Cache ownership must still be released if an annotator is already gone.
+                pass
 
     def discover_environments(self) -> Dict[str, Dict[str, str]]:
         """Scan the Isaac Sim asset server for available environment USD files."""
@@ -146,9 +163,13 @@ class IsaacAdapterV5(IsaacAdapterBase):
         prim_path: str,
         position: Optional[Sequence[float]] = None,
         rotation: Optional[Sequence[float]] = None,
+        orientation: Optional[Sequence[float]] = None,
         scale: Optional[Sequence[float]] = None,
     ) -> None:
         from pxr import Gf, UsdGeom
+
+        if rotation is not None and orientation is not None:
+            raise ValueError("rotation and orientation are mutually exclusive")
 
         stage = self.get_stage()
         prim = stage.GetPrimAtPath(prim_path)
@@ -163,6 +184,10 @@ class IsaacAdapterV5(IsaacAdapterBase):
         if rotation is not None:
             xformable.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
                 Gf.Vec3d(*rotation)
+            )
+        if orientation is not None:
+            xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Quatd(orientation[0], Gf.Vec3d(*orientation[1:]))
             )
         if scale is not None:
             xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
@@ -817,14 +842,71 @@ class IsaacAdapterV5(IsaacAdapterBase):
     # ── Sensors ────────────────────────────────────────────
 
     def create_camera(
-        self, prim_path: str, resolution: Tuple[int, int] = (1280, 720), **kwargs
+        self,
+        prim_path: str,
+        resolution: Tuple[int, int] = (1280, 720),
+        position: Optional[Sequence[float]] = None,
+        rotation: Optional[Sequence[float]] = None,
+        orientation: Optional[Sequence[float]] = None,
+        focal_length: Optional[float] = None,
+        focus_distance: Optional[float] = None,
+        horizontal_aperture: Optional[float] = None,
+        vertical_aperture: Optional[float] = None,
+        clipping_range: Optional[Sequence[float]] = None,
     ) -> Any:
         from isaacsim.sensors.camera import Camera
+        from pxr import Gf, UsdGeom
 
-        camera = Camera(prim_path=prim_path, resolution=resolution, **kwargs)
-        camera.initialize()
+        self._release_cached_cameras(prim_path)
+        camera_prim = UsdGeom.Camera.Define(self.get_stage(), prim_path)
+        self.set_prim_transform(
+            prim_path,
+            position=position,
+            rotation=rotation,
+            orientation=orientation,
+        )
+        if focal_length is not None:
+            camera_prim.GetFocalLengthAttr().Set(focal_length)
+        if focus_distance is not None:
+            camera_prim.GetFocusDistanceAttr().Set(focus_distance)
+        if horizontal_aperture is not None:
+            camera_prim.GetHorizontalApertureAttr().Set(horizontal_aperture)
+        if vertical_aperture is not None:
+            camera_prim.GetVerticalApertureAttr().Set(vertical_aperture)
+        if clipping_range is not None:
+            camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(*clipping_range))
+
+        camera = Camera(prim_path=prim_path, resolution=resolution)
+        try:
+            camera.initialize()
+        except Exception:
+            try:
+                camera.destroy()
+            except Exception:
+                pass
+            raise
         self._camera_cache[prim_path] = camera
         return camera
+
+    def set_active_camera(self, prim_path: str) -> Dict[str, Any]:
+        import omni.kit.app
+        from omni.kit.viewport.utility import get_active_viewport
+        from pxr import UsdGeom
+
+        prim = self.get_stage().GetPrimAtPath(prim_path)
+        if not prim.IsValid() or not prim.IsA(UsdGeom.Camera):
+            raise ValueError(f"Camera prim does not exist at {prim_path}")
+        viewport = get_active_viewport()
+        if viewport is None:
+            raise RuntimeError("No active viewport")
+        previous_camera = str(viewport.camera_path)
+        viewport.camera_path = prim_path
+        omni.kit.app.get_app().update()
+        return {
+            "previous_camera": previous_camera,
+            "active_camera": str(viewport.camera_path),
+            "resolution": list(viewport.resolution),
+        }
 
     def capture_camera_image(self, prim_path: str) -> np.ndarray:
         from isaacsim.sensors.camera import Camera
@@ -1025,7 +1107,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         omni.timeline.get_timeline_interface().stop()
         self._articulation_cache.clear()
         self._joint_name_cache.clear()
-        self._camera_cache.clear()
+        self._release_cached_cameras()
 
     def ping(self) -> Dict[str, Any]:
         import omni.usd
