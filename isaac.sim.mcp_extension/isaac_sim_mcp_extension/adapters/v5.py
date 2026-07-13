@@ -87,9 +87,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
             camera = self._camera_cache.pop(path)
             try:
                 camera.destroy()
-            except Exception:
+            except Exception as exc:
                 # Cache ownership must still be released if an annotator is already gone.
-                pass
+                import carb
+
+                carb.log_warn(f"Failed to destroy cached camera at {path}: {exc}")
 
     def discover_environments(self) -> Dict[str, Dict[str, str]]:
         """Scan the Isaac Sim asset server for available environment USD files."""
@@ -882,8 +884,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
         except Exception:
             try:
                 camera.destroy()
-            except Exception:
-                pass
+            except Exception as exc:
+                import carb
+
+                carb.log_warn(
+                    f"Failed to destroy camera at {prim_path} after initialization failure: {exc}"
+                )
             raise
         self._camera_cache[prim_path] = camera
         return camera

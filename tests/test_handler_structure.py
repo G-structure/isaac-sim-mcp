@@ -141,6 +141,7 @@ def test_v5_adapter_owns_initialized_camera_lifecycle():
     assert "self._camera_cache[prim_path] = camera" in source
     assert "self._release_cached_cameras(prim_path)" in source
     assert "camera.destroy()" in source
+    assert source.count("carb.log_warn(") >= 2
     capture_source = source.split("    def capture_camera_image", 1)[1].split(
         "    def create_lidar", 1
     )[0]
