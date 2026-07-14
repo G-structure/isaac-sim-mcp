@@ -74,15 +74,22 @@ class MCPExtension(omni.ext.IExt):
         self._register_legacy_handlers()
         print(f"Registered {len(self._registry)} command handlers")
 
-        self._server = SocketServer(host, port, self._execute_command)
-        update_stream = omni.kit.app.get_app().get_update_event_stream()
-        self._update_subscription = update_stream.create_subscription_to_pop(
-            self._on_update,
-            name=f"{ext_id} socket command pump",
-        )
-        # Retain the update subscription before accepting sockets. Its callback
-        # is Kit-owned main-thread execution; socket workers only enqueue and wait.
-        self._server.start()
+        server = SocketServer(host, port, self._execute_command)
+        self._server = server
+        try:
+            update_stream = omni.kit.app.get_app().get_update_event_stream()
+            self._update_subscription = update_stream.create_subscription_to_pop(
+                self._on_update,
+                name=f"{ext_id} socket command pump",
+            )
+            # Retain the update subscription before accepting sockets. Its callback
+            # is Kit-owned main-thread execution; socket workers only enqueue and wait.
+            server.start()
+        except Exception:
+            self._update_subscription = None
+            self._server = None
+            server.stop()
+            raise
         # NOTE: workspace stage persistence is owned EXCLUSIVELY by warm_slot_agent
         # (save_open_stage), which saves the open root layer IN PLACE and coordinates
         # with the S3 sync daemon. The extension intentionally does NOT autosave: a

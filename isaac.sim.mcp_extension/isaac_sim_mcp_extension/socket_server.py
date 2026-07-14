@@ -56,6 +56,9 @@ class SocketServer:
         Callable invoked with the parsed command dict; must return a response dict.
     """
 
+    _MAX_PENDING_COMMANDS = 64
+    _MAX_COMMANDS_PER_DRAIN = 8
+
     def __init__(
         self,
         host: str,
@@ -72,7 +75,9 @@ class SocketServer:
         self._server_thread: threading.Thread | None = None
         self._lifecycle_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        self._pending_commands: queue.Queue[_PendingCommand] = queue.Queue()
+        self._pending_commands: queue.Queue[_PendingCommand] = queue.Queue(
+            maxsize=self._MAX_PENDING_COMMANDS
+        )
         self._outstanding_commands: set[_PendingCommand] = set()
         self._drain_lock = threading.Lock()
         self._clients_lock = threading.Lock()
@@ -108,13 +113,15 @@ class SocketServer:
                 )
                 self._server_thread.start()
                 print(f"Isaac Sim MCP server started on {self.host}:{self.port}")
-            except Exception as e:
+            except (OSError, RuntimeError) as exc:
                 if server_socket is not None:
                     self._close_socket(server_socket)
                 with self._state_lock:
                     self.running = False
                     self._socket = None
-                print(f"Failed to start server: {e}")
+                self._server_thread = None
+                print(f"Failed to start server: {exc}")
+                raise
 
     def stop(self) -> None:
         """Stop accepting work, resolve pending commands, and join workers."""
@@ -127,7 +134,7 @@ class SocketServer:
             if server_socket is not None:
                 self._close_socket(server_socket)
 
-            self._resolve_outstanding(
+            started_commands = self._resolve_waiting_commands(
                 {
                     "status": "error",
                     "message": "Isaac MCP server stopped before command completed",
@@ -143,6 +150,7 @@ class SocketServer:
                 server_thread.join(timeout=1.0)
             self._server_thread = None
 
+            self._wait_for_started_commands(started_commands)
             self._wait_for_active_dispatches(timeout=1.0)
             with self._clients_lock:
                 clients = list(self._clients)
@@ -172,13 +180,15 @@ class SocketServer:
         if not self._drain_lock.acquire(blocking=False):
             return 0
 
+        dequeued = 0
         executed = 0
         try:
-            while True:
+            while dequeued < self._MAX_COMMANDS_PER_DRAIN:
                 try:
                     pending = self._pending_commands.get_nowait()
                 except queue.Empty:
                     break
+                dequeued += 1
 
                 with self._state_lock:
                     if pending not in self._outstanding_commands or not self.running:
@@ -271,7 +281,14 @@ class SocketServer:
             if not self.running:
                 return {"status": "error", "message": "Isaac MCP server is stopping"}
             self._outstanding_commands.add(pending)
-            self._pending_commands.put(pending)
+            try:
+                self._pending_commands.put_nowait(pending)
+            except queue.Full:
+                self._outstanding_commands.remove(pending)
+                return {
+                    "status": "error",
+                    "message": "Isaac MCP command queue is full; retry later",
+                }
 
         try:
             return pending.future.result(timeout=self._command_timeout)
@@ -279,30 +296,40 @@ class SocketServer:
             with self._state_lock:
                 if pending not in self._outstanding_commands:
                     return pending.future.result()
-                self._outstanding_commands.remove(pending)
-                pending.future.cancel()
-                started = pending.started
+                if pending.started:
+                    wait_for_completion = True
+                else:
+                    self._outstanding_commands.remove(pending)
+                    pending.future.cancel()
+                    wait_for_completion = False
 
-            wait_target = (
-                "command execution on the Isaac main thread"
-                if started
-                else "the Isaac main-thread update pump"
-            )
+            if wait_for_completion:
+                return pending.future.result()
             return {
                 "status": "error",
-                "message": f"Command timed out after {self._command_timeout:g}s waiting for {wait_target}",
+                "message": f"Command timed out after {self._command_timeout:g}s waiting for the Isaac main-thread update pump",
             }
-        except Exception as e:
-            traceback.print_exc()
-            return {"status": "error", "message": str(e)}
 
-    def _resolve_outstanding(self, response: Dict[str, Any]) -> None:
+    def _resolve_waiting_commands(
+        self, response: Dict[str, Any]
+    ) -> list[_PendingCommand]:
         with self._state_lock:
-            pending_commands = list(self._outstanding_commands)
-            self._outstanding_commands.clear()
-            for pending in pending_commands:
+            started_commands = []
+            for pending in list(self._outstanding_commands):
+                if pending.started:
+                    started_commands.append(pending)
+                    continue
+                self._outstanding_commands.remove(pending)
                 if not pending.future.done():
                     pending.future.set_result(dict(response))
+            return started_commands
+
+    @staticmethod
+    def _wait_for_started_commands(
+        started_commands: list[_PendingCommand],
+    ) -> None:
+        for pending in started_commands:
+            pending.future.result()
 
     def _discard_queued_commands(self) -> None:
         while True:
