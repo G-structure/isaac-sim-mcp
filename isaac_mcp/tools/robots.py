@@ -95,7 +95,11 @@ def register_tools(
             return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool("get_robot_info")
-    def get_robot_info(prim_path: str, require_runtime: bool = False) -> str:
+    def get_robot_info(
+        prim_path: str,
+        require_runtime: bool = False,
+        refresh_runtime: bool = False,
+    ) -> str:
         """Get robot joint information including names, DOF count, joint types, and limits.
 
         Call this after create_robot to understand the robot's kinematic structure.
@@ -105,12 +109,17 @@ def register_tools(
         Args:
             prim_path: The prim path of the robot.
             require_runtime: Require live articulation data instead of USD fallback metadata.
+            refresh_runtime: Rebuild the live articulation view before reading it.
         """
         try:
             conn = get_connection()
             result = conn.send_command(
                 "robots.get_info",
-                {"prim_path": prim_path, "require_runtime": require_runtime},
+                {
+                    "prim_path": prim_path,
+                    "require_runtime": require_runtime,
+                    "refresh_runtime": refresh_runtime,
+                },
             )
             return json.dumps(result, indent=2)
         except Exception as e:

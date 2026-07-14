@@ -91,6 +91,11 @@ class RuntimeArticulation:
         return self._positions
 
 
+class StaleRuntimeArticulation(RuntimeArticulation):
+    def get_joint_positions(self) -> np.ndarray | None:
+        raise RuntimeError("Failed to get DOF positions from backend")
+
+
 def _load_robot_tools(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     mcp_module = types.ModuleType("mcp")
     mcp_module.__path__ = []
@@ -116,7 +121,11 @@ def test_robot_tools_forward_require_runtime(monkeypatch: pytest.MonkeyPatch) ->
     tool_module.register_tools(mcp, lambda: connection)
 
     assert json.loads(
-        mcp.tools["get_robot_info"]("/World/Robot", require_runtime=True)
+        mcp.tools["get_robot_info"](
+            "/World/Robot",
+            require_runtime=True,
+            refresh_runtime=True,
+        )
     ) == {"status": "success"}
     assert json.loads(
         mcp.tools["get_joint_positions"]("/World/Robot", require_runtime=True)
@@ -127,7 +136,11 @@ def test_robot_tools_forward_require_runtime(monkeypatch: pytest.MonkeyPatch) ->
     assert connection.calls == [
         (
             "robots.get_info",
-            {"prim_path": "/World/Robot", "require_runtime": True},
+            {
+                "prim_path": "/World/Robot",
+                "require_runtime": True,
+                "refresh_runtime": True,
+            },
         ),
         (
             "robots.get_joints",
@@ -135,7 +148,11 @@ def test_robot_tools_forward_require_runtime(monkeypatch: pytest.MonkeyPatch) ->
         ),
         (
             "robots.get_info",
-            {"prim_path": "/World/Legacy", "require_runtime": False},
+            {
+                "prim_path": "/World/Legacy",
+                "require_runtime": False,
+                "refresh_runtime": False,
+            },
         ),
         (
             "robots.get_joints",
@@ -147,12 +164,17 @@ def test_robot_tools_forward_require_runtime(monkeypatch: pytest.MonkeyPatch) ->
 def test_handlers_standardize_runtime_provenance_and_preserve_default_shapes() -> None:
     class Adapter:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str, bool]] = []
+            self.calls: list[tuple[str, str, bool, bool]] = []
 
         def get_robot_joint_info(
-            self, prim_path: str, require_runtime: bool = False
+            self,
+            prim_path: str,
+            require_runtime: bool = False,
+            refresh_runtime: bool = False,
         ) -> dict[str, Any]:
-            self.calls.append(("info", prim_path, require_runtime))
+            self.calls.append(
+                ("info", prim_path, require_runtime, refresh_runtime)
+            )
             return {
                 "joint_names": ["joint_a"],
                 "num_dof": 1,
@@ -162,12 +184,17 @@ def test_handlers_standardize_runtime_provenance_and_preserve_default_shapes() -
         def get_joint_positions(
             self, prim_path: str, require_runtime: bool = False
         ) -> list[float]:
-            self.calls.append(("positions", prim_path, require_runtime))
+            self.calls.append(("positions", prim_path, require_runtime, False))
             return [0.25]
 
     adapter = Adapter()
 
-    assert robot_handlers.get_info(adapter, "/World/Robot", require_runtime=True) == {
+    assert robot_handlers.get_info(
+        adapter,
+        "/World/Robot",
+        require_runtime=True,
+        refresh_runtime=True,
+    ) == {
         "status": "success",
         "joint_names": ["joint_a"],
         "num_dof": 1,
@@ -190,10 +217,10 @@ def test_handlers_standardize_runtime_provenance_and_preserve_default_shapes() -
         "joint_positions": [0.25],
     }
     assert adapter.calls == [
-        ("info", "/World/Robot", True),
-        ("positions", "/World/Robot", True),
-        ("info", "/World/Legacy", False),
-        ("positions", "/World/Legacy", False),
+        ("info", "/World/Robot", True, True),
+        ("positions", "/World/Robot", True, False),
+        ("info", "/World/Legacy", False, False),
+        ("positions", "/World/Legacy", False, False),
     ]
 
 
@@ -212,6 +239,96 @@ def test_v5_required_reads_use_runtime_articulation_without_usd() -> None:
         0.25,
         -0.5,
     ]
+
+
+def test_v5_required_reads_refresh_stale_runtime_articulation_once() -> None:
+    adapter = v5.IsaacAdapterV5()
+    prim_path = "/World/Robot"
+    stale = StaleRuntimeArticulation(["joint_a"], np.array([0.0]))
+    fresh = RuntimeArticulation(["joint_a"], np.array([0.25]))
+    adapter._articulation_cache[prim_path] = stale
+    adapter._joint_name_cache[prim_path] = ["stale_joint"]
+    resolved: list[RuntimeArticulation] = []
+
+    def get_cached(path: str) -> RuntimeArticulation:
+        articulation = adapter._articulation_cache.get(path)
+        if articulation is None:
+            articulation = fresh
+            adapter._articulation_cache[path] = articulation
+        resolved.append(articulation)
+        return articulation
+
+    adapter._get_cached_articulation = get_cached
+    adapter.get_stage = lambda: pytest.fail("required runtime read traversed USD")
+
+    assert adapter.get_joint_positions(prim_path, require_runtime=True) == [0.25]
+    assert resolved == [stale, fresh]
+    assert adapter._articulation_cache[prim_path] is fresh
+    assert prim_path not in adapter._joint_name_cache
+
+
+def test_v5_explicit_refresh_replaces_plausible_stale_articulation() -> None:
+    adapter = v5.IsaacAdapterV5()
+    prim_path = "/World/Robot"
+    stale = RuntimeArticulation(["stale_joint"], np.array([9.0]))
+    fresh = RuntimeArticulation(["joint_a"], np.array([0.25]))
+    adapter._articulation_cache[prim_path] = stale
+
+    def get_cached(path: str) -> RuntimeArticulation:
+        articulation = adapter._articulation_cache.get(path)
+        if articulation is None:
+            articulation = fresh
+            adapter._articulation_cache[path] = articulation
+        return articulation
+
+    adapter._get_cached_articulation = get_cached
+    adapter.get_stage = lambda: pytest.fail("required runtime read traversed USD")
+
+    assert adapter.get_robot_joint_info(
+        prim_path,
+        require_runtime=True,
+        refresh_runtime=True,
+    ) == {
+        "joint_names": ["joint_a"],
+        "num_dof": 1,
+        "joint_limits": [{"name": "joint_a"}],
+    }
+    assert adapter._articulation_cache[prim_path] is fresh
+
+
+def test_v5_rejects_refresh_without_runtime_measurement() -> None:
+    adapter = v5.IsaacAdapterV5()
+
+    with pytest.raises(
+        ValueError,
+        match="refresh_runtime=True requires require_runtime=True",
+    ):
+        adapter.get_robot_joint_info(
+            "/World/Robot",
+            refresh_runtime=True,
+        )
+
+
+def test_v5_forgets_articulation_cache_for_replaced_prim_subtree() -> None:
+    adapter = v5.IsaacAdapterV5()
+    robot = RuntimeArticulation(["robot_joint"], np.array([0.0]))
+    child = RuntimeArticulation(["child_joint"], np.array([0.0]))
+    other = RuntimeArticulation(["other_joint"], np.array([0.0]))
+    adapter._articulation_cache = {
+        "/World/Robot": robot,
+        "/World/Robot/Tool": child,
+        "/World/Other": other,
+    }
+    adapter._joint_name_cache = {
+        "/World/Robot": ["robot_joint"],
+        "/World/Robot/Tool": ["child_joint"],
+        "/World/Other": ["other_joint"],
+    }
+
+    adapter._forget_cached_articulations("/World/Robot")
+
+    assert adapter._articulation_cache == {"/World/Other": other}
+    assert adapter._joint_name_cache == {"/World/Other": ["other_joint"]}
 
 
 @pytest.mark.parametrize("method_name", ["get_robot_joint_info", "get_joint_positions"])
