@@ -32,7 +32,9 @@ if TYPE_CHECKING:
     from isaac_mcp.connection import IsaacConnection
 
 
-def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]") -> None:
+def register_tools(
+    mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
+) -> None:
 
     @mcp.tool("create_robot")
     def create_robot(
@@ -93,7 +95,7 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool("get_robot_info")
-    def get_robot_info(prim_path: str) -> str:
+    def get_robot_info(prim_path: str, require_runtime: bool = False) -> str:
         """Get robot joint information including names, DOF count, joint types, and limits.
 
         Call this after create_robot to understand the robot's kinematic structure.
@@ -102,17 +104,23 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
 
         Args:
             prim_path: The prim path of the robot.
+            require_runtime: Require live articulation data instead of USD fallback metadata.
         """
         try:
             conn = get_connection()
-            result = conn.send_command("robots.get_info", {"prim_path": prim_path})
+            result = conn.send_command(
+                "robots.get_info",
+                {"prim_path": prim_path, "require_runtime": require_runtime},
+            )
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool("set_joint_positions")
     def set_joint_positions(
-        prim_path: str, joint_positions: List[float], joint_indices: Optional[List[int]] = None
+        prim_path: str,
+        joint_positions: List[float],
+        joint_indices: Optional[List[int]] = None,
     ) -> str:
         """Set target joint positions on a robot via ArticulationAction.
 
@@ -137,7 +145,7 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool("get_joint_positions")
-    def get_joint_positions(prim_path: str) -> str:
+    def get_joint_positions(prim_path: str, require_runtime: bool = False) -> str:
         """Read current joint positions from a robot.
 
         Units: radians for revolute joints, meters for prismatic joints.
@@ -146,10 +154,14 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
 
         Args:
             prim_path: The prim path of the robot.
+            require_runtime: Require measured articulation positions instead of USD drive targets.
         """
         try:
             conn = get_connection()
-            result = conn.send_command("robots.get_joints", {"prim_path": prim_path})
+            result = conn.send_command(
+                "robots.get_joints",
+                {"prim_path": prim_path, "require_runtime": require_runtime},
+            )
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})

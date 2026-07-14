@@ -154,8 +154,10 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def get_robot_joint_info(self, prim_path: str) -> Dict[str, Any]:
-        """Return joint names, DOF count, and current positions for a robot."""
+    def get_robot_joint_info(
+        self, prim_path: str, require_runtime: bool = False
+    ) -> Dict[str, Any]:
+        """Return robot joint metadata, optionally requiring live articulation data."""
         ...
 
     @abstractmethod
@@ -169,8 +171,10 @@ class IsaacAdapterBase(ABC):
         ...
 
     @abstractmethod
-    def get_joint_positions(self, prim_path: str) -> List[float]:
-        """Read current joint positions from a robot articulation."""
+    def get_joint_positions(
+        self, prim_path: str, require_runtime: bool = False
+    ) -> List[float]:
+        """Read joint positions, optionally rejecting non-runtime fallback values."""
         ...
 
     @abstractmethod

@@ -54,8 +54,16 @@ FALLBACK_ROBOT_LIBRARY: Dict[str, Dict[str, str]] = {
         "description": "NVIDIA NovaCarter",
         "manufacturer": "NVIDIA",
     },
-    "g1": {"asset_path": "/Isaac/Robots/Unitree/G1/g1.usd", "description": "Unitree G1", "manufacturer": "Unitree"},
-    "go1": {"asset_path": "/Isaac/Robots/Unitree/Go1/go1.usd", "description": "Unitree Go1", "manufacturer": "Unitree"},
+    "g1": {
+        "asset_path": "/Isaac/Robots/Unitree/G1/g1.usd",
+        "description": "Unitree G1",
+        "manufacturer": "Unitree",
+    },
+    "go1": {
+        "asset_path": "/Isaac/Robots/Unitree/Go1/go1.usd",
+        "description": "Unitree Go1",
+        "manufacturer": "Unitree",
+    },
     "spot": {
         "asset_path": "/Isaac/Robots/BostonDynamics/spot/spot.usd",
         "description": "BostonDynamics spot",
@@ -65,6 +73,7 @@ FALLBACK_ROBOT_LIBRARY: Dict[str, Dict[str, str]] = {
 
 # Cached discovered robots — populated on first call to list_robots.
 _discovered_robots: Optional[Dict[str, Dict[str, str]]] = None
+_RUNTIME_MEASUREMENT_SOURCE = "runtime_articulation"
 
 
 def _get_robot_library(adapter: IsaacAdapterBase) -> Dict[str, Dict[str, str]]:
@@ -192,12 +201,19 @@ def refresh_robots(adapter: IsaacAdapterBase) -> Dict[str, Any]:
     }
 
 
-def get_info(adapter: IsaacAdapterBase, prim_path: Optional[str] = None) -> Dict[str, Any]:
+def get_info(
+    adapter: IsaacAdapterBase,
+    prim_path: Optional[str] = None,
+    require_runtime: bool = False,
+) -> Dict[str, Any]:
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
-        info = adapter.get_robot_joint_info(prim_path)
-        return {"status": "success", **info}
+        info = adapter.get_robot_joint_info(prim_path, require_runtime=require_runtime)
+        result = {"status": "success", **info}
+        if require_runtime:
+            result["measurement_source"] = _RUNTIME_MEASUREMENT_SOURCE
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -210,18 +226,30 @@ def set_joints(
 ) -> Dict[str, Any]:
     try:
         if not prim_path or joint_positions is None:
-            return {"status": "error", "message": "prim_path and joint_positions are required"}
+            return {
+                "status": "error",
+                "message": "prim_path and joint_positions are required",
+            }
         adapter.set_joint_positions(prim_path, joint_positions, joint_indices)
         return {"status": "success", "message": f"Set joint positions on {prim_path}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-def get_joints(adapter: IsaacAdapterBase, prim_path: Optional[str] = None) -> Dict[str, Any]:
+def get_joints(
+    adapter: IsaacAdapterBase,
+    prim_path: Optional[str] = None,
+    require_runtime: bool = False,
+) -> Dict[str, Any]:
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
-        positions = adapter.get_joint_positions(prim_path)
-        return {"status": "success", "joint_positions": positions}
+        positions = adapter.get_joint_positions(
+            prim_path, require_runtime=require_runtime
+        )
+        result = {"status": "success", "joint_positions": positions}
+        if require_runtime:
+            result["measurement_source"] = _RUNTIME_MEASUREMENT_SOURCE
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
