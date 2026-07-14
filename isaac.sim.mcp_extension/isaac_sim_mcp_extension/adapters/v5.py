@@ -1426,14 +1426,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
             timeline = omni.timeline.get_timeline_interface()
             timeline.pause()
+            timeline.commit()
             try:
                 self._ensure_physics_world()
                 timeline.play()
+                timeline.commit()
                 for _ in range(num_steps):
                     omni.kit.app.get_app().update()
                     stepped += 1
             finally:
                 timeline.pause()
+                timeline.commit()
         else:
             for _ in range(min(max(0, num_steps), max_step_frames)):
                 if (time.monotonic() - start) * 1000 >= effective_budget_ms:

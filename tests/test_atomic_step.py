@@ -100,15 +100,23 @@ def _install_fake_omni(
     events: list[str] = []
 
     class Timeline:
-        state = "playing"
+        def __init__(self) -> None:
+            self.state = "playing"
+            self.pending_state: str | None = None
 
         def pause(self) -> None:
             events.append("pause")
-            self.state = "paused"
+            self.pending_state = "paused"
 
         def play(self) -> None:
             events.append("play")
-            self.state = "playing"
+            self.pending_state = "playing"
+
+        def commit(self) -> None:
+            events.append("commit")
+            if self.pending_state is not None:
+                self.state = self.pending_state
+                self.pending_state = None
 
     class App:
         updates = 0
@@ -195,12 +203,15 @@ def test_atomic_step_runs_exact_updates_and_pauses(monkeypatch) -> None:
 
     assert events == [
         "pause",
+        "commit",
         "ensure",
         "play",
+        "commit",
         "update",
         "update",
         "update",
         "pause",
+        "commit",
     ]
     assert timeline.state == "paused"
     assert result == {
@@ -223,11 +234,14 @@ def test_atomic_step_pauses_when_update_fails(monkeypatch) -> None:
 
     assert events == [
         "pause",
+        "commit",
         "ensure",
         "play",
+        "commit",
         "update",
         "update",
         "pause",
+        "commit",
     ]
     assert timeline.state == "paused"
 
