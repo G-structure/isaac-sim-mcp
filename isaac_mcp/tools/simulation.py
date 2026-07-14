@@ -71,6 +71,7 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
         observe_joints: Optional[List[str]] = None,
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
+        pause_after: bool = False,
     ) -> str:
         """Step the simulation forward by N frames, then observe prim and joint states.
 
@@ -92,10 +93,13 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             budget_ms: Optional wall-clock budget for stepping.
             observe_cap: Optional cap on articulation observations. Under low RAM,
                 observe one articulation at a time.
+            pause_after: Atomically pause, play exactly num_steps app updates, and
+                pause again before returning. The exact-step mode is not shortened
+                by budget_ms.
         """
         try:
             conn = get_connection()
-            params = {"num_steps": num_steps}
+            params = {"num_steps": num_steps, "pause_after": pause_after}
             if observe_prims is not None:
                 params["observe_prims"] = observe_prims
             if observe_joints is not None:

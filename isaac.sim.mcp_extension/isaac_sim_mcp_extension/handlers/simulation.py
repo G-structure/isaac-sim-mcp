@@ -83,6 +83,7 @@ def step(
     observe_joints: Optional[Sequence[str]] = None,
     budget_ms: Optional[int] = None,
     observe_cap: Optional[int] = None,
+    pause_after: bool = False,
 ) -> Dict[str, Any]:
     try:
         result = adapter.step(
@@ -91,6 +92,7 @@ def step(
             observe_joints=observe_joints,
             budget_ms=budget_ms,
             observe_cap=observe_cap,
+            pause_after=pause_after,
         )
         # A budget-trip is a graceful PARTIAL result, not a failure. Returning
         # status="timeout" made _execute_command collapse the whole payload to a
