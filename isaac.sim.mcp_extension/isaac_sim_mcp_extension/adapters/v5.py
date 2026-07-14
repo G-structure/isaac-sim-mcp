@@ -55,6 +55,10 @@ _ROTATION_XFORM_OP_NAMES = frozenset(
 )
 
 
+class _RuntimeArticulationReadError(RuntimeError):
+    """A live articulation read failed without consulting USD fallback state."""
+
+
 def _xform_op_name(op: Any) -> str:
     return str(op.GetOpName())
 
@@ -141,9 +145,34 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def delete_prim(self, prim_path: str) -> bool:
         import omni.kit.commands
 
+        self._forget_cached_articulations(prim_path)
         self._release_cached_cameras(prim_path, forget_resolution=True)
         omni.kit.commands.execute("DeletePrims", paths=[prim_path])
         return True
+
+    def _forget_cached_articulations(self, prim_path: Optional[str] = None) -> None:
+        paths = [
+            path
+            for path in self._articulation_cache
+            if prim_path is None
+            or path == prim_path
+            or path.startswith(f"{prim_path}/")
+        ]
+        for path in paths:
+            self._articulation_cache.pop(path, None)
+            self._joint_name_cache.pop(path, None)
+
+        if prim_path is None:
+            self._joint_name_cache.clear()
+            return
+
+        joint_name_paths = [
+            path
+            for path in self._joint_name_cache
+            if path == prim_path or path.startswith(f"{prim_path}/")
+        ]
+        for path in joint_name_paths:
+            self._joint_name_cache.pop(path, None)
 
     def _release_cached_cameras(
         self,
@@ -243,6 +272,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def add_reference_to_stage(self, usd_path: str, prim_path: str) -> Usd.Prim:
         from isaacsim.core.utils.stage import add_reference_to_stage
 
+        self._forget_cached_articulations(prim_path)
         return add_reference_to_stage(usd_path, prim_path)
 
     def set_prim_transform(
@@ -534,8 +564,15 @@ class IsaacAdapterV5(IsaacAdapterBase):
         return SingleArticulation(prim_path=prim_path, name=name)
 
     def get_robot_joint_info(
-        self, prim_path: str, require_runtime: bool = False
+        self,
+        prim_path: str,
+        require_runtime: bool = False,
+        refresh_runtime: bool = False,
     ) -> Dict[str, Any]:
+        if refresh_runtime and not require_runtime:
+            raise ValueError("refresh_runtime=True requires require_runtime=True")
+        if refresh_runtime:
+            self._forget_cached_articulations(prim_path)
         if require_runtime:
             joint_names, _ = self._get_required_runtime_joint_state(prim_path)
             return {
@@ -749,11 +786,29 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def _get_required_runtime_joint_state(
         self, prim_path: str
     ) -> Tuple[List[str], List[float]]:
+        try:
+            return self._read_required_runtime_joint_state(prim_path)
+        except _RuntimeArticulationReadError as initial_error:
+            # Runtime USD edits can invalidate a physics view while its handle
+            # still reports valid. Recreate the articulation once, then remain
+            # fail-closed if the fresh backend read is unavailable.
+            self._forget_cached_articulations(prim_path)
+            try:
+                return self._read_required_runtime_joint_state(prim_path)
+            except _RuntimeArticulationReadError as refresh_error:
+                raise _RuntimeArticulationReadError(
+                    f"{refresh_error}; runtime articulation refresh also failed "
+                    f"after initial error: {initial_error}"
+                ) from refresh_error
+
+    def _read_required_runtime_joint_state(
+        self, prim_path: str
+    ) -> Tuple[List[str], List[float]]:
         fallback_message = "require_runtime=True forbids USD fallback"
         try:
             art = self._get_cached_articulation(prim_path)
         except Exception as exc:
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime articulation unavailable for {prim_path}; "
                 f"{fallback_message}: {exc}"
             ) from exc
@@ -763,12 +818,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
             try:
                 physics_handle_valid = bool(is_valid())
             except Exception as exc:
-                raise RuntimeError(
+                raise _RuntimeArticulationReadError(
                     f"Could not validate the runtime articulation for {prim_path}; "
                     f"{fallback_message}: {exc}"
                 ) from exc
             if not physics_handle_valid:
-                raise RuntimeError(
+                raise _RuntimeArticulationReadError(
                     f"Runtime articulation unavailable for {prim_path}; "
                     f"{fallback_message}"
                 )
@@ -777,26 +832,26 @@ class IsaacAdapterV5(IsaacAdapterBase):
             raw_names = art.dof_names
             joint_names = list(raw_names) if raw_names is not None else []
         except Exception as exc:
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime joint names unavailable for {prim_path}; "
                 f"{fallback_message}: {exc}"
             ) from exc
         if not joint_names or any(
             name is None or not str(name) for name in joint_names
         ):
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime joint names unavailable for {prim_path}; {fallback_message}"
             )
 
         try:
             runtime_positions = art.get_joint_positions()
         except Exception as exc:
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime joint positions unavailable for {prim_path}; "
                 f"{fallback_message}: {exc}"
             ) from exc
         if runtime_positions is None:
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime joint positions unavailable for {prim_path}; "
                 f"{fallback_message}"
             )
@@ -809,13 +864,13 @@ class IsaacAdapterV5(IsaacAdapterBase):
             )
             joint_positions = [float(value) for value in values]
         except Exception as exc:
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime joint positions invalid for {prim_path}; "
                 f"{fallback_message}: {exc}"
             ) from exc
 
         if len(joint_names) != len(joint_positions):
-            raise RuntimeError(
+            raise _RuntimeArticulationReadError(
                 f"Runtime articulation data incomplete for {prim_path}: "
                 f"received {len(joint_names)} joint names and "
                 f"{len(joint_positions)} positions; {fallback_message}"
@@ -1311,8 +1366,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         import omni.timeline
 
         omni.timeline.get_timeline_interface().stop()
-        self._articulation_cache.clear()
-        self._joint_name_cache.clear()
+        self._forget_cached_articulations()
         self._release_cached_cameras()
 
     def ping(self) -> Dict[str, Any]:

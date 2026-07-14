@@ -205,11 +205,16 @@ def get_info(
     adapter: IsaacAdapterBase,
     prim_path: Optional[str] = None,
     require_runtime: bool = False,
+    refresh_runtime: bool = False,
 ) -> Dict[str, Any]:
     try:
         if not prim_path:
             return {"status": "error", "message": "prim_path is required"}
-        info = adapter.get_robot_joint_info(prim_path, require_runtime=require_runtime)
+        info = adapter.get_robot_joint_info(
+            prim_path,
+            require_runtime=require_runtime,
+            refresh_runtime=refresh_runtime,
+        )
         result = {"status": "success", **info}
         if require_runtime:
             result["measurement_source"] = _RUNTIME_MEASUREMENT_SOURCE

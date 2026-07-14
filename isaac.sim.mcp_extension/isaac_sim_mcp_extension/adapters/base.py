@@ -155,9 +155,12 @@ class IsaacAdapterBase(ABC):
 
     @abstractmethod
     def get_robot_joint_info(
-        self, prim_path: str, require_runtime: bool = False
+        self,
+        prim_path: str,
+        require_runtime: bool = False,
+        refresh_runtime: bool = False,
     ) -> Dict[str, Any]:
-        """Return robot joint metadata, optionally requiring live articulation data."""
+        """Return joint metadata, optionally rebuilding and requiring runtime data."""
         ...
 
     @abstractmethod
