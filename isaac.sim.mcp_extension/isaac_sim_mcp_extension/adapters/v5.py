@@ -533,7 +533,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
         return SingleArticulation(prim_path=prim_path, name=name)
 
-    def get_robot_joint_info(self, prim_path: str) -> Dict[str, Any]:
+    def get_robot_joint_info(
+        self, prim_path: str, require_runtime: bool = False
+    ) -> Dict[str, Any]:
+        if require_runtime:
+            joint_names, _ = self._get_required_runtime_joint_state(prim_path)
+            return {
+                "joint_names": joint_names,
+                "num_dof": len(joint_names),
+                "joint_limits": [{"name": name} for name in joint_names],
+            }
+
         from isaacsim.core.prims import SingleArticulation
         from pxr import Usd, UsdPhysics
 
@@ -690,7 +700,13 @@ class IsaacAdapterV5(IsaacAdapterBase):
             self._joint_name_cache[prim_path] = names
         return names
 
-    def get_joint_positions(self, prim_path: str) -> List[float]:
+    def get_joint_positions(
+        self, prim_path: str, require_runtime: bool = False
+    ) -> List[float]:
+        if require_runtime:
+            _, positions = self._get_required_runtime_joint_state(prim_path)
+            return positions
+
         try:
             art = self._get_cached_articulation(prim_path)
             positions = art.get_joint_positions()
@@ -729,6 +745,82 @@ class IsaacAdapterV5(IsaacAdapterBase):
             else:
                 positions_list.append(0.0)
         return positions_list
+
+    def _get_required_runtime_joint_state(
+        self, prim_path: str
+    ) -> Tuple[List[str], List[float]]:
+        fallback_message = "require_runtime=True forbids USD fallback"
+        try:
+            art = self._get_cached_articulation(prim_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Runtime articulation unavailable for {prim_path}; "
+                f"{fallback_message}: {exc}"
+            ) from exc
+
+        is_valid = getattr(art, "is_physics_handle_valid", None)
+        if callable(is_valid):
+            try:
+                physics_handle_valid = bool(is_valid())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not validate the runtime articulation for {prim_path}; "
+                    f"{fallback_message}: {exc}"
+                ) from exc
+            if not physics_handle_valid:
+                raise RuntimeError(
+                    f"Runtime articulation unavailable for {prim_path}; "
+                    f"{fallback_message}"
+                )
+
+        try:
+            raw_names = art.dof_names
+            joint_names = list(raw_names) if raw_names is not None else []
+        except Exception as exc:
+            raise RuntimeError(
+                f"Runtime joint names unavailable for {prim_path}; "
+                f"{fallback_message}: {exc}"
+            ) from exc
+        if not joint_names or any(
+            name is None or not str(name) for name in joint_names
+        ):
+            raise RuntimeError(
+                f"Runtime joint names unavailable for {prim_path}; {fallback_message}"
+            )
+
+        try:
+            runtime_positions = art.get_joint_positions()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Runtime joint positions unavailable for {prim_path}; "
+                f"{fallback_message}: {exc}"
+            ) from exc
+        if runtime_positions is None:
+            raise RuntimeError(
+                f"Runtime joint positions unavailable for {prim_path}; "
+                f"{fallback_message}"
+            )
+
+        try:
+            values = (
+                runtime_positions.tolist()
+                if hasattr(runtime_positions, "tolist")
+                else list(runtime_positions)
+            )
+            joint_positions = [float(value) for value in values]
+        except Exception as exc:
+            raise RuntimeError(
+                f"Runtime joint positions invalid for {prim_path}; "
+                f"{fallback_message}: {exc}"
+            ) from exc
+
+        if len(joint_names) != len(joint_positions):
+            raise RuntimeError(
+                f"Runtime articulation data incomplete for {prim_path}: "
+                f"received {len(joint_names)} joint names and "
+                f"{len(joint_positions)} positions; {fallback_message}"
+            )
+        return [str(name) for name in joint_names], joint_positions
 
     def _get_cached_articulation(self, prim_path: str) -> Any:
         from isaacsim.core.prims import SingleArticulation
@@ -1475,12 +1567,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
         stage = self.get_stage()
         physics_dt = 1.0 / 60.0  # default
         for prim in stage.Traverse():
-            if prim.HasAPI(UsdPhysics.Scene):
+            if prim.IsA(UsdPhysics.Scene):
                 time_step_attr = prim.GetAttribute("physxScene:timeStepsPerSecond")
-                if time_step_attr and time_step_attr.Get():
-                    steps_per_sec = time_step_attr.Get()
-                    if steps_per_sec > 0:
-                        physics_dt = 1.0 / steps_per_sec
+                steps_per_sec = time_step_attr.Get() if time_step_attr else None
+                if steps_per_sec is not None and steps_per_sec > 0:
+                    physics_dt = 1.0 / float(steps_per_sec)
                 break
 
         return {
