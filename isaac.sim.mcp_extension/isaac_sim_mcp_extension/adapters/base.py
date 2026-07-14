@@ -361,6 +361,7 @@ class IsaacAdapterBase(ABC):
         observe_joints: Optional[List[str]] = None,
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
+        pause_after: bool = False,
     ) -> Dict[str, Any]:
         """Step the simulation forward and optionally observe prim/joint states.
 
@@ -370,6 +371,7 @@ class IsaacAdapterBase(ABC):
             observe_joints: Articulation paths to snapshot (joint positions).
             budget_ms: Optional wall-clock budget.
             observe_cap: Optional cap on articulation observations.
+            pause_after: Pause before stepping and after exactly num_steps updates.
         """
         ...
 

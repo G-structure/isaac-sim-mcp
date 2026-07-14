@@ -1309,6 +1309,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         observe_joints: Optional[List[str]] = None,
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
+        pause_after: bool = False,
     ) -> Dict[str, Any]:
         import omni.kit.app
 
@@ -1323,17 +1324,45 @@ class IsaacAdapterV5(IsaacAdapterBase):
         max_step_frames = 4000
         stepped = 0
         timed_out = False
-        for _ in range(min(max(0, num_steps), max_step_frames)):
-            if (time.monotonic() - start) * 1000 >= effective_budget_ms:
-                timed_out = True
-                break
-            omni.kit.app.get_app().update()
-            stepped += 1
+        if pause_after:
+            if not 0 <= num_steps <= max_step_frames:
+                raise ValueError(
+                    f"pause_after requires num_steps between 0 and {max_step_frames}"
+                )
+
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            timeline.pause()
+            try:
+                self._ensure_physics_world()
+                timeline.play()
+                for _ in range(num_steps):
+                    omni.kit.app.get_app().update()
+                    stepped += 1
+            finally:
+                timeline.pause()
+        else:
+            for _ in range(min(max(0, num_steps), max_step_frames)):
+                if (time.monotonic() - start) * 1000 >= effective_budget_ms:
+                    timed_out = True
+                    break
+                omni.kit.app.get_app().update()
+                stepped += 1
 
         result: Dict[str, Any] = {
             "stepped": stepped,
             "resources": self.get_resources(compact=True),
         }
+        if pause_after:
+            result.update(
+                {
+                    "requested_steps": num_steps,
+                    "pause_after": True,
+                    "exact_step_completed": stepped == num_steps,
+                    "timeline_state": "paused",
+                }
+            )
         if timed_out:
             result["timed_out"] = True
 
