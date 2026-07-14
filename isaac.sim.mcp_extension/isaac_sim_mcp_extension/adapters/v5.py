@@ -29,7 +29,7 @@ import traceback
 import os
 import subprocess
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -39,6 +39,75 @@ if TYPE_CHECKING:
     from pxr import Usd
 
 
+_ROTATION_XFORM_OP_NAMES = frozenset(
+    {
+        "xformOp:orient",
+        "xformOp:rotateX",
+        "xformOp:rotateY",
+        "xformOp:rotateZ",
+        "xformOp:rotateXYZ",
+        "xformOp:rotateXZY",
+        "xformOp:rotateYXZ",
+        "xformOp:rotateYZX",
+        "xformOp:rotateZXY",
+        "xformOp:rotateZYX",
+    }
+)
+
+
+def _xform_op_name(op: Any) -> str:
+    return str(op.GetOpName())
+
+
+def _set_xform_op(
+    xformable: Any,
+    op_name: str,
+    add_op: Callable[[], Any],
+    value: Any,
+) -> None:
+    for op in xformable.GetOrderedXformOps():
+        if _xform_op_name(op) == op_name:
+            op.Set(value)
+            return
+    add_op().Set(value)
+
+
+def _set_rotation_xform_op(
+    xformable: Any,
+    op_name: str,
+    add_op: Callable[[], Any],
+    value: Any,
+) -> None:
+    ordered_ops = list(xformable.GetOrderedXformOps())
+    target_op = next((op for op in ordered_ops if _xform_op_name(op) == op_name), None)
+    rotation_indexes = [
+        index
+        for index, op in enumerate(ordered_ops)
+        if _xform_op_name(op) in _ROTATION_XFORM_OP_NAMES
+    ]
+
+    if target_op is None:
+        target_op = add_op()
+    target_op.Set(value)
+
+    if not rotation_indexes:
+        return
+
+    first_rotation_index = rotation_indexes[0]
+    insert_at = sum(
+        _xform_op_name(op) not in _ROTATION_XFORM_OP_NAMES
+        for op in ordered_ops[:first_rotation_index]
+    )
+    replacement_order = [
+        op for op in ordered_ops if _xform_op_name(op) not in _ROTATION_XFORM_OP_NAMES
+    ]
+    replacement_order.insert(insert_at, target_op)
+    xformable.SetXformOpOrder(
+        replacement_order,
+        xformable.GetResetXformStack(),
+    )
+
+
 class IsaacAdapterV5(IsaacAdapterBase):
     """Adapter for Isaac Sim 5.1.0 (isaacsim.* namespace)."""
 
@@ -46,6 +115,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         self._articulation_cache: Dict[str, Any] = {}
         self._joint_name_cache: Dict[str, List[str]] = {}
         self._camera_cache: Dict[str, Any] = {}
+        self._camera_resolutions: Dict[str, Tuple[int, int]] = {}
 
     # ── Scene ──────────────────────────────────────────────
 
@@ -71,11 +141,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
     def delete_prim(self, prim_path: str) -> bool:
         import omni.kit.commands
 
-        self._release_cached_cameras(prim_path)
+        self._release_cached_cameras(prim_path, forget_resolution=True)
         omni.kit.commands.execute("DeletePrims", paths=[prim_path])
         return True
 
-    def _release_cached_cameras(self, prim_path: Optional[str] = None) -> None:
+    def _release_cached_cameras(
+        self,
+        prim_path: Optional[str] = None,
+        *,
+        forget_resolution: bool = False,
+    ) -> None:
         paths = [
             path
             for path in self._camera_cache
@@ -92,6 +167,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
                 import carb
 
                 carb.log_warn(f"Failed to destroy cached camera at {path}: {exc}")
+        if forget_resolution:
+            resolution_paths = [
+                path
+                for path in self._camera_resolutions
+                if prim_path is None
+                or path == prim_path
+                or path.startswith(f"{prim_path}/")
+            ]
+            for path in resolution_paths:
+                self._camera_resolutions.pop(path)
 
     def discover_environments(self) -> Dict[str, Dict[str, str]]:
         """Scan the Isaac Sim asset server for available environment USD files."""
@@ -178,22 +263,39 @@ class IsaacAdapterV5(IsaacAdapterBase):
         if not prim.IsValid():
             raise ValueError(f"Prim not found: {prim_path}")
         xformable = UsdGeom.Xformable(prim)
-        xformable.ClearXformOpOrder()
         if position is not None:
-            xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Vec3d(*position)
+            _set_xform_op(
+                xformable,
+                "xformOp:translate",
+                lambda: xformable.AddTranslateOp(
+                    precision=UsdGeom.XformOp.PrecisionDouble
+                ),
+                Gf.Vec3d(*position),
             )
         if rotation is not None:
-            xformable.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Vec3d(*rotation)
+            _set_rotation_xform_op(
+                xformable,
+                "xformOp:rotateXYZ",
+                lambda: xformable.AddRotateXYZOp(
+                    precision=UsdGeom.XformOp.PrecisionDouble
+                ),
+                Gf.Vec3d(*rotation),
             )
         if orientation is not None:
-            xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Quatd(orientation[0], Gf.Vec3d(*orientation[1:]))
+            _set_rotation_xform_op(
+                xformable,
+                "xformOp:orient",
+                lambda: xformable.AddOrientOp(
+                    precision=UsdGeom.XformOp.PrecisionDouble
+                ),
+                Gf.Quatd(orientation[0], Gf.Vec3d(*orientation[1:])),
             )
         if scale is not None:
-            xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Vec3d(*scale)
+            _set_xform_op(
+                xformable,
+                "xformOp:scale",
+                lambda: xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble),
+                Gf.Vec3d(*scale),
             )
 
     def get_prim_transform(self, prim_path: str) -> Dict[str, Any]:
@@ -859,7 +961,9 @@ class IsaacAdapterV5(IsaacAdapterBase):
         from isaacsim.sensors.camera import Camera
         from pxr import Gf, UsdGeom
 
+        resolution = (resolution[0], resolution[1])
         self._release_cached_cameras(prim_path)
+        self._camera_resolutions[prim_path] = resolution
         camera_prim = UsdGeom.Camera.Define(self.get_stage(), prim_path)
         self.set_prim_transform(
             prim_path,
@@ -919,7 +1023,11 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
         camera = self._camera_cache.get(prim_path)
         if camera is None:
-            camera = Camera(prim_path=prim_path)
+            resolution = self._camera_resolutions.get(prim_path)
+            if resolution is None:
+                camera = Camera(prim_path=prim_path)
+            else:
+                camera = Camera(prim_path=prim_path, resolution=resolution)
             camera.initialize()
             self._camera_cache[prim_path] = camera
         image = camera.get_rgba()
