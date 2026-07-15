@@ -237,6 +237,40 @@ product initializes. Replacing a camera or deleting its prim destroys the
 cached wrapper first, preventing stale render products from returning blank or
 clipped frames.
 
+### Gaussian Splats / NuRec
+
+- **load_gaussian_splat** references a `.usd`, `.usda`, `.usdc`, or `.usdz`
+  below `/World`, waits up to a bounded timeout for stage composition, frames
+  the active viewport by default, and returns schema, renderer, Kit update-time,
+  and GPU evidence. It recognizes the standard
+  `ParticleField3DGaussianSplat` representation and the legacy NuRec
+  `Volume` + `OmniNuRecFieldAsset` representation. SPG/PPISP sidecars are
+  detected separately; only those assets enable `omni.rtx.spg` and force the
+  documented Gaussian tonemapping override. Plain ParticleFields keep the
+  engine default.
+- **inspect_gaussian_splat** repeats the same bounded, read-only evidence pass
+  for an existing subtree.
+
+Treat `ready=true` as a USD-composition and renderer-path result, not proof of
+correct pixels. The response makes that boundary explicit with
+`schema_ready`, `render_path_ready`, `fidelity_ready`, `readiness_scope`, and
+`pixel_proof`.
+Review a CUA/viewport image and compare the scene with the returned
+`pixel_proof.render_prim_paths` visible and hidden before claiming visual
+correctness. ParticleField validation checks required geometry arrays, matching
+authored counts, SH degree/coefficient shape, sampled finite/range constraints,
+and bounds. Standards-compliant missing SH or opacity data can still pass
+`schema_ready` and `render_path_ready` because OpenUSD defines gray and fully
+opaque fallbacks, but it fails `fidelity_ready`: source color/opacity has not
+been proven. SH `elementSize` and `interpolation` metadata are reported when
+present but their absence alone does not fail either readiness check. Legacy
+`.nurec` payloads remain opaque, so the tool reports `particle_count=null` and
+`fidelity_ready=false` rather than inventing evidence.
+
+Presigned URL query strings and fragments are never returned in evidence. Kit
+update duration is labeled as CPU-observed timing and must be paired with
+viewport FPS/frame-time and GPU evidence when setting a performance threshold.
+
 ### Usage Best Practices
 
 1. Always check connection with `get_scene_info` before executing any commands

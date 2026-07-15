@@ -197,6 +197,7 @@ def test_all_handler_modules_have_register():
         "sensors.py",
         "materials.py",
         "assets.py",
+        "gaussian_splats.py",
         "simulation.py",
     ]
     for filename in handler_files:
