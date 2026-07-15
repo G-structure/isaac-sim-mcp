@@ -113,8 +113,12 @@ def inspect_root(root: Any, *, renderer: Dict[str, Any]) -> Dict[str, Any]:
         spg["present"]
         and settings.get("/rtx/rtpt/gaussian/skipTonemapping/enabled") is not False
     ):
-        warnings.append(
-            "SPG/PPISP is present but Gaussian skip-tonemapping is not explicitly false; output color may diverge from the asset"
+        errors.append(
+            "SPG/PPISP requires /rtx/rtpt/gaussian/skipTonemapping/enabled=false"
+        )
+    if spg["present"] and settings.get("/rtx/spg/enabled") is not True:
+        errors.append(
+            "SPG/PPISP requires /rtx/spg/enabled=true before the first Hydra sync"
         )
     if (
         spg["present"]
@@ -175,6 +179,7 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
     path = str(prim.GetPath())
     errors: list[str] = []
     fidelity_errors: list[str] = []
+    fidelity_limitations: list[str] = []
     warnings: list[str] = []
     values: Dict[str, Any] = {}
     attributes: Dict[str, Dict[str, Any]] = {}
@@ -214,9 +219,25 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
         errors.append(f"{path}: positions must contain at least one Gaussian")
     for name in ("orientations", "scales", "opacities"):
         value = values.get(name)
-        if value is not None and len(value) != particle_count:
-            errors.append(
-                f"{path}: {name} count {len(value)} does not match positions count {particle_count}"
+        if value is None:
+            continue
+        value_count = len(value)
+        if value_count < particle_count:
+            values.pop(name)
+            warnings.append(
+                f"{path}: {name} count {value_count} is shorter than positions count "
+                f"{particle_count}; OpenUSD ignores it and uses the schema default"
+            )
+            fidelity_limitations.append(
+                f"{path}: authored {name} is too short and is ignored by OpenUSD"
+            )
+        elif value_count > particle_count:
+            warnings.append(
+                f"{path}: {name} count {value_count} exceeds positions count "
+                f"{particle_count}; OpenUSD truncates the extra values"
+            )
+            fidelity_limitations.append(
+                f"{path}: authored {name} contains values truncated by OpenUSD"
             )
 
     degree_attr, degree_value = _first_authored_attribute(
@@ -248,6 +269,7 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
     if coefficient_attr is not None:
         element_size = coefficient_attr.GetMetadata("elementSize")
         interpolation = coefficient_attr.GetMetadata("interpolation")
+    effective_coefficient_count: Optional[int] = None
     if coefficients is None:
         fidelity_errors.append(
             f"{path}: SH coefficients are not authored; source radiance cannot be proven"
@@ -258,11 +280,27 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
     elif degree is not None:
         expected_element_size = (degree + 1) ** 2
         expected_coefficients = particle_count * expected_element_size
-        if len(coefficients) != expected_coefficients:
-            errors.append(
-                f"{path}: SH coefficient count {len(coefficients)} does not match "
-                f"{particle_count} particles x {expected_element_size}"
+        coefficient_count = len(coefficients)
+        if coefficient_count < expected_coefficients:
+            values.pop("sh_coefficients", None)
+            fidelity_errors.append(
+                f"{path}: SH coefficient count {coefficient_count} is shorter than "
+                f"{particle_count} particles x {expected_element_size}; source radiance "
+                "cannot be proven"
             )
+            warnings.append(
+                f"{path}: OpenUSD ignores too-short SH coefficients and uses its degree-0 gray fallback"
+            )
+        else:
+            effective_coefficient_count = expected_coefficients
+            if coefficient_count > expected_coefficients:
+                warnings.append(
+                    f"{path}: SH coefficient count {coefficient_count} exceeds "
+                    f"{particle_count} particles x {expected_element_size}; OpenUSD truncates the extra values"
+                )
+                fidelity_limitations.append(
+                    f"{path}: authored SH coefficients contain values truncated by OpenUSD"
+                )
         if element_size is not None and element_size != expected_element_size:
             errors.append(
                 f"{path}: SH elementSize {element_size!r} does not match degree {degree}"
@@ -287,6 +325,8 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
         scales=values.get("scales"),
         opacities=values.get("opacities"),
         coefficients=values.get("sh_coefficients"),
+        particle_count=particle_count,
+        coefficient_count=effective_coefficient_count,
         errors=errors,
     )
     extent = _extent_report(prim, path, errors)
@@ -305,7 +345,7 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
         "sampled_values_per_attribute": min(particle_count, _MAX_VALUE_SAMPLES),
         "errors": _unique(errors),
         "fidelity_errors": _unique(fidelity_errors),
-        "fidelity_limitations": [],
+        "fidelity_limitations": _unique(fidelity_limitations),
         "warnings": _unique(warnings),
     }
 
@@ -406,6 +446,8 @@ def _validate_numeric_samples(
     scales: Any,
     opacities: Any,
     coefficients: Any,
+    particle_count: int,
+    coefficient_count: Optional[int],
     errors: list[str],
 ) -> None:
     for value in _sample_values(positions):
@@ -413,7 +455,7 @@ def _validate_numeric_samples(
         if len(components) != 3 or not _all_finite(components):
             errors.append(f"{path}: sampled positions must be finite 3D vectors")
             break
-    for value in _sample_values(scales):
+    for value in _sample_values(scales, effective_count=particle_count):
         components = _components(value)
         if (
             len(components) != 3
@@ -422,7 +464,7 @@ def _validate_numeric_samples(
         ):
             errors.append(f"{path}: sampled scales must be finite positive 3D vectors")
             break
-    for value in _sample_values(opacities):
+    for value in _sample_values(opacities, effective_count=particle_count):
         components = _components(value)
         if (
             len(components) != 1
@@ -431,7 +473,7 @@ def _validate_numeric_samples(
         ):
             errors.append(f"{path}: sampled opacities must be finite and within [0, 1]")
             break
-    for value in _sample_values(orientations):
+    for value in _sample_values(orientations, effective_count=particle_count):
         components = _quaternion_components(value)
         norm = math.sqrt(sum(component * component for component in components))
         if (
@@ -443,7 +485,7 @@ def _validate_numeric_samples(
                 f"{path}: sampled orientations must be finite unit quaternions"
             )
             break
-    for value in _sample_values(coefficients):
+    for value in _sample_values(coefficients, effective_count=coefficient_count):
         components = _components(value)
         if len(components) != 3 or not _all_finite(components):
             errors.append(f"{path}: sampled SH coefficients must be finite 3D vectors")
@@ -506,10 +548,9 @@ def _first_nonempty_authored_attribute(
     """Prefer an authored non-empty float array, then its half alias.
 
     OpenUSD's ParticleField APIs select float storage only when it contains at
-    least one value. Preserve the first authored empty array as a diagnostic
-    fallback when no alias contains data.
+    least one value. When every authored alias is empty, return no value so
+    optional per-particle arrays use their schema defaults.
     """
-    fallback: tuple[Any, Any] = (None, None)
     for name in names:
         attr = prim.GetAttribute(name)
         if not attr:
@@ -520,14 +561,12 @@ def _first_nonempty_authored_attribute(
         value = attr.Get()
         if value is None:
             continue
-        if fallback[0] is None:
-            fallback = (attr, value)
         try:
             if len(value) > 0:
                 return attr, value
         except TypeError:
             return attr, value
-    return fallback
+    return None, None
 
 
 def attribute_value(prim: Any, name: str) -> Any:
@@ -550,12 +589,18 @@ def _asset_paths(value: Any) -> tuple[str, str]:
     return str(raw if raw is not None else value), str(resolved or "")
 
 
-def _sample_values(values: Any) -> Iterable[Any]:
+def _sample_values(
+    values: Any, *, effective_count: Optional[int] = None
+) -> Iterable[Any]:
     if values is None:
         return ()
     count = len(values)
+    if effective_count is not None:
+        count = min(count, effective_count)
     if count <= _MAX_VALUE_SAMPLES:
-        return values
+        if count == len(values):
+            return values
+        return (values[index] for index in range(count))
     step = max(1, math.ceil(count / _MAX_VALUE_SAMPLES))
     return (values[index] for index in range(0, count, step))
 
