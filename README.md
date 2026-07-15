@@ -162,6 +162,49 @@ The Isaac Sim MCP Extension provides several specialized tools that can be acces
   that must use the live articulation controller and reject the legacy USD
   drive-target fallback.
 
+### Contact Integrity
+
+- **step_simulation** accepts `pause_after=true` for one atomic control
+  interval. Add `contact_integrity` to copy bounded PhysX contact evidence after
+  every requested update:
+
+```json
+{
+  "num_steps": 8,
+  "pause_after": true,
+  "contact_integrity": {
+    "max_contacts_per_pair": 64,
+    "limits": {
+      "maximum_penetration_m": 0.001,
+      "maximum_normal_impulse_ns": 0.5
+    },
+    "pairs": [
+      {
+        "label": "left-finger-cube",
+        "sensor_path": "/World/robot/left_finger",
+        "filter_path": "/World/cube"
+      }
+    ]
+  }
+}
+```
+
+Each contact includes its world point, normal, signed separation, derived
+penetration, normal impulse, step-equivalent normal force, and separately
+reported friction impulse. Negative separation means interpenetration. The
+trace reports `complete=false` on a missing tensor view, non-finite data, a
+missing update, or a full contact buffer. Contact capture requires atomic mode
+because PhysX reuses contact buffers after the next physics update. When
+`limits` are present, `within_configured_limits` and `violations` provide a
+machine-readable physics-quality verdict without relying on rendered frames.
+The product of updates, pairs, and per-pair capacity may not exceed 8192 contact
+slots, so an untrusted caller cannot request an unbounded in-memory trace.
+
+`get_physics_state` now reads rigid-body velocity from an exact PhysX tensor
+view. It reports `velocity_complete=false` rather than substituting zero when a
+live velocity is unavailable. Its `contacts` field is intentionally marked
+`contacts_complete=false`; use the atomic contact trace for contact evidence.
+
 ### Omniverse Kit and Scripting
 
 - **omni_kit_command** - Executes an Omni Kit command:

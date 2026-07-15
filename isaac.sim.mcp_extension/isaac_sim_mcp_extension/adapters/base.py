@@ -376,6 +376,7 @@ class IsaacAdapterBase(ABC):
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
         pause_after: bool = False,
+        contact_integrity: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Step the simulation forward and optionally observe prim/joint states.
 
@@ -386,6 +387,7 @@ class IsaacAdapterBase(ABC):
             budget_ms: Optional wall-clock budget.
             observe_cap: Optional cap on articulation observations.
             pause_after: Pause before stepping and after exactly num_steps updates.
+            contact_integrity: Optional bounded per-update contact trace request.
         """
         ...
 

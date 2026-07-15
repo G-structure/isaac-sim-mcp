@@ -24,7 +24,7 @@
 """Simulation control MCP tools."""
 
 import json
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -72,6 +72,7 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
         pause_after: bool = False,
+        contact_integrity: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Step the simulation forward by N frames, then observe prim and joint states.
 
@@ -96,6 +97,10 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
             pause_after: Atomically pause, play exactly num_steps app updates, and
                 pause again before returning. The exact-step mode is not shortened
                 by budget_ms.
+            contact_integrity: Optional bounded contact trace. Requires
+                pause_after=true. Each pair names exact sensor_path and filter_path
+                rigid bodies and returns signed separation and impulse evidence after
+                each requested update.
         """
         try:
             conn = get_connection()
@@ -108,6 +113,8 @@ def register_tools(mcp: FastMCP, get_connection: "Callable[[], IsaacConnection]"
                 params["budget_ms"] = budget_ms
             if observe_cap is not None:
                 params["observe_cap"] = observe_cap
+            if contact_integrity is not None:
+                params["contact_integrity"] = contact_integrity
             result = conn.send_command("simulation.step", params)
             return json.dumps(result, indent=2)
         except Exception as e:
