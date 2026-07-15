@@ -53,6 +53,8 @@ _ROTATION_XFORM_OP_NAMES = frozenset(
         "xformOp:rotateZYX",
     }
 )
+_RUNTIME_CONTROL_SOURCE = "runtime_articulation"
+_USD_CONTROL_SOURCE = "usd_drive_target"
 
 
 class _RuntimeArticulationReadError(RuntimeError):
@@ -643,7 +645,8 @@ class IsaacAdapterV5(IsaacAdapterBase):
         prim_path: str,
         positions: Sequence[float],
         joint_indices: Optional[List[int]] = None,
-    ) -> None:
+        require_runtime: bool = False,
+    ) -> str:
         from isaacsim.core.prims import SingleArticulation
         from isaacsim.core.utils.types import ArticulationAction
 
@@ -656,9 +659,16 @@ class IsaacAdapterV5(IsaacAdapterBase):
             )
             controller = art.get_articulation_controller()
             controller.apply_action(action)
-        except Exception:
+            return _RUNTIME_CONTROL_SOURCE
+        except Exception as exc:
+            if require_runtime:
+                raise RuntimeError(
+                    f"Runtime articulation control unavailable for {prim_path}; "
+                    f"require_runtime=True forbids USD fallback: {exc}"
+                ) from exc
             # Fallback: set USD drive targets directly (works when sim is stopped)
             self._set_joint_drive_targets(prim_path, positions, joint_indices)
+            return _USD_CONTROL_SOURCE
 
     def _set_joint_drive_targets(
         self,

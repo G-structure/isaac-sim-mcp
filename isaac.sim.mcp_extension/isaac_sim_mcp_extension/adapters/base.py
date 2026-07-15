@@ -169,8 +169,15 @@ class IsaacAdapterBase(ABC):
         prim_path: str,
         positions: Sequence[float],
         joint_indices: Optional[List[int]] = None,
-    ) -> None:
-        """Set target joint positions on a robot articulation."""
+        require_runtime: bool = False,
+    ) -> str:
+        """Set joint targets and return the actuation control source.
+
+        Implementations return ``runtime_articulation`` when the targets were
+        applied through the live articulation controller, or
+        ``usd_drive_target`` when compatibility fallback authored USD targets.
+        ``require_runtime=True`` must reject fallback actuation.
+        """
         ...
 
     @abstractmethod
