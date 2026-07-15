@@ -115,10 +115,8 @@ def load_gaussian_splat(
                 ),
             }
 
-        root = stage.DefinePrim(target_path, "Xform")
+        _author_asset_reference(stage, target_path, source)
         created_prim = True
-        if not root.GetReferences().AddReference(source):
-            raise RuntimeError(f"USD reference could not be authored for {safe_source}")
         if position_value is not None or scale_value is not None:
             adapter.set_prim_transform(
                 target_path,
@@ -249,6 +247,15 @@ def inspect_gaussian_splat(
         }
 
 
+def _author_asset_reference(stage: Any, target_path: str, source: str) -> Any:
+    """Compose a referenced default prim without overriding its schema type."""
+    root = stage.OverridePrim(target_path)
+    if not root.GetReferences().AddReference(source):
+        stage.RemovePrim(target_path)
+        raise RuntimeError("USD reference could not be authored")
+    return root
+
+
 def _runtime_evidence(
     *,
     stage: Any,
@@ -264,17 +271,20 @@ def _runtime_evidence(
 
     app = omni.kit.app.get_app()
     context = omni.usd.get_context()
+    root = stage.GetPrimAtPath(root_path)
+    configuration = (
+        _configure_renderer_for_asset(app, stage, root)
+        if configure_renderer
+        else {"attempted": False, "reason": "inspection is read-only"}
+    )
+    # NuRec/SPG settings are sampled at the first Hydra sync for the stage.
+    # Keep this wait, and therefore its first app.update(), after setup.
     stage_loading = _wait_for_stage(
         app,
         context,
         timeout_seconds=wait_timeout_seconds,
     )
     root = stage.GetPrimAtPath(root_path)
-    configuration = (
-        _configure_renderer_for_asset(app, root)
-        if configure_renderer
-        else {"attempted": False, "reason": "inspection is read-only"}
-    )
     renderer = _renderer_evidence(app)
     renderer["configuration"] = configuration
     asset = _inspect_root(root, renderer=renderer)
@@ -369,6 +379,7 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
         "/renderer/multiGpu/enabled",
         "/rtx/rtpt/gaussian/skipTonemapping/enabled",
         "/rtx/spg/enabled",
+        "/omni/rtx/nre/compositing/disableNuRecPostProcessings",
     )
     try:
         import carb
@@ -399,12 +410,13 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
     }
 
 
-def _configure_renderer_for_asset(app: Any, root: Any) -> Dict[str, Any]:
+def _configure_renderer_for_asset(app: Any, stage: Any, root: Any) -> Dict[str, Any]:
     """Apply only settings required by representations present in ``root``.
 
     Plain ParticleFields keep the engine tonemapping default. SPG/PPISP assets
-    require the SPG extension and the explicit Gaussian tonemapping override
-    documented by the NuRec utility workflow.
+    require the launch-time SPG extension and every pre-Hydra override owned by
+    the installed NuRec utility. Call this before the first ``app.update()``
+    after the asset is composed.
     """
     spg_present = has_spg(root)
     if not spg_present:
@@ -415,32 +427,41 @@ def _configure_renderer_for_asset(app: Any, root: Any) -> Dict[str, Any]:
             "errors": [],
         }
 
-    actions = []
-    errors = []
+    actions: list[str] = []
+    errors: list[str] = []
     try:
         extension_manager = app.get_extension_manager()
         if not extension_manager.is_extension_enabled("omni.rtx.spg"):
-            extension_manager.set_extension_enabled_immediate("omni.rtx.spg", True)
-            actions.append("enabled omni.rtx.spg")
+            errors.append(
+                "omni.rtx.spg is not enabled; SPG must be enabled at process launch"
+            )
     except Exception as exc:
-        errors.append(f"could not enable omni.rtx.spg: {exc}")
+        errors.append(f"could not inspect omni.rtx.spg launch state: {exc}")
+    if errors:
+        return {
+            "attempted": True,
+            "asset_mode": "spg_ppisp",
+            "actions": actions,
+            "errors": errors,
+        }
     try:
-        import carb
+        from isaacsim.replicator.nurec_utils.rendering_setup import (
+            setup_for_rendering,
+        )
 
-        settings = carb.settings.get_settings()
-        settings.set_bool(
-            "/rtx/rtpt/gaussian/skipTonemapping/enabled",
-            False,
-        )
-        settings.set_bool("/rtx/spg/enabled", True)
-        actions.extend(
-            [
-                "set Gaussian skip-tonemapping false for SPG/PPISP",
-                "enabled the SPG renderer setting",
-            ]
-        )
+        success, nurec, spg, problems = setup_for_rendering(stage)
+        if not success:
+            errors.extend(str(problem) for problem in problems)
+        elif not nurec or not spg:
+            errors.append(
+                "NuRec utility did not classify the composed asset as SPG/PPISP"
+            )
+        else:
+            actions.append(
+                "applied isaacsim.replicator.nurec_utils pre-Hydra SPG overrides"
+            )
     except Exception as exc:
-        errors.append(f"could not apply SPG renderer settings: {exc}")
+        errors.append(f"could not apply NuRec pre-Hydra renderer setup: {exc}")
     return {
         "attempted": True,
         "asset_mode": "spg_ppisp",
