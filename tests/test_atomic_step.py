@@ -9,6 +9,7 @@ import types
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 
@@ -190,7 +191,244 @@ def test_step_handler_propagates_pause_after() -> None:
         "budget_ms": None,
         "observe_cap": None,
         "pause_after": True,
+        "contact_integrity": None,
     }
+
+
+def test_step_tool_propagates_contact_integrity(monkeypatch) -> None:
+    tool_module = _load_simulation_tool(monkeypatch)
+    mcp = RecordingMCP()
+    connection = RecordingConnection()
+    tool_module.register_tools(mcp, lambda: connection)
+    contact_integrity = {
+        "pairs": [
+            {
+                "label": "left-cube",
+                "sensor_path": "/World/left_finger",
+                "filter_path": "/World/cube",
+            }
+        ]
+    }
+
+    response = json.loads(
+        mcp.tools["step_simulation"](
+            num_steps=2,
+            pause_after=True,
+            contact_integrity=contact_integrity,
+        )
+    )
+
+    assert response == {"status": "success"}
+    assert connection.calls == [
+        (
+            "simulation.step",
+            {
+                "num_steps": 2,
+                "pause_after": True,
+                "contact_integrity": contact_integrity,
+            },
+        )
+    ]
+
+
+def test_step_handler_propagates_contact_integrity() -> None:
+    class Adapter:
+        received: dict[str, Any] | None = None
+
+        def step(self, **params: Any) -> dict[str, Any]:
+            self.received = params
+            return {"stepped": 1}
+
+    adapter = Adapter()
+    contact_integrity = {"pairs": [{"a": "/World/left_finger", "b": "/World/cube"}]}
+
+    response = simulation_handler.step(
+        adapter,
+        num_steps=1,
+        pause_after=True,
+        contact_integrity=contact_integrity,
+    )
+
+    assert response["status"] == "success"
+    assert adapter.received is not None
+    assert adapter.received["contact_integrity"] == contact_integrity
+
+
+def test_contact_integrity_requires_atomic_step(monkeypatch) -> None:
+    _install_fake_omni(monkeypatch)
+    adapter = v5.IsaacAdapterV5()
+
+    with pytest.raises(ValueError, match="requires pause_after=true"):
+        adapter.step(
+            num_steps=1,
+            contact_integrity={"pairs": [{"a": "/World/a", "b": "/World/b"}]},
+        )
+
+
+def test_atomic_step_samples_and_closes_contact_trace(monkeypatch) -> None:
+    events, _ = _install_fake_omni(monkeypatch)
+    samples: list[int] = []
+
+    class FakeSampler:
+        def __init__(self, stage: Any, config: dict[str, Any]) -> None:
+            assert stage == "stage"
+            assert config["pairs"][0]["label"] == "left-cube"
+
+        def prepare(self) -> None:
+            events.append("contact_prepare")
+
+        def validate_request_size(self, requested_updates: int) -> None:
+            assert requested_updates == 3
+
+        def sample(self, *, update_index: int, physics_dt_seconds: float) -> None:
+            assert physics_dt_seconds == pytest.approx(1.0 / 120.0)
+            samples.append(update_index)
+
+        def close(self) -> None:
+            events.append("contact_close")
+
+        def result(
+            self, *, requested_updates: int, physics_dt_seconds: float
+        ) -> dict[str, Any]:
+            return {
+                "complete": samples == list(range(requested_updates)),
+                "physics_dt_seconds": physics_dt_seconds,
+                "samples": list(samples),
+            }
+
+    contact_module = types.ModuleType("isaac_sim_mcp_extension.contact_integrity")
+    contact_module.ContactIntegritySampler = FakeSampler
+    monkeypatch.setitem(
+        sys.modules, "isaac_sim_mcp_extension.contact_integrity", contact_module
+    )
+    adapter = v5.IsaacAdapterV5()
+    adapter._ensure_physics_world = lambda: events.append("ensure")
+    adapter.get_stage = lambda: "stage"
+    adapter.get_resources = lambda compact=False: {"available_ram_mb": 4096}
+    adapter.get_simulation_state = lambda: {"physics_dt": 1.0 / 120.0}
+
+    result = adapter.step(
+        num_steps=3,
+        pause_after=True,
+        contact_integrity={
+            "pairs": [
+                {
+                    "label": "left-cube",
+                    "sensor_path": "/World/left_finger",
+                    "filter_path": "/World/cube",
+                }
+            ]
+        },
+    )
+
+    assert samples == [0, 1, 2]
+    assert result["contact_integrity"] == {
+        "complete": True,
+        "physics_dt_seconds": pytest.approx(1.0 / 120.0),
+        "samples": [0, 1, 2],
+    }
+    assert events.index("contact_prepare") < events.index("play")
+    assert events[-1] == "contact_close"
+
+
+def test_physics_state_uses_exact_runtime_velocity_and_marks_contacts_incomplete(
+    monkeypatch,
+) -> None:
+    class Attr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def Get(self) -> Any:
+            return self.value
+
+        def IsValid(self) -> bool:
+            return True
+
+    class RigidBodyAPI:
+        def __init__(self, prim: Any) -> None:
+            self.prim = prim
+
+        def GetKinematicEnabledAttr(self) -> Attr:
+            return Attr(False)
+
+    class MassAPI:
+        def __init__(self, prim: Any) -> None:
+            self.prim = prim
+
+        def GetMassAttr(self) -> Attr:
+            return Attr(0.04)
+
+    class CollisionAPI:
+        def __init__(self, prim: Any) -> None:
+            self.prim = prim
+
+        def GetCollisionEnabledAttr(self) -> Attr:
+            return Attr(True)
+
+    class Prim:
+        def IsValid(self) -> bool:
+            return True
+
+        def HasAPI(self, api: Any) -> bool:
+            return api in {RigidBodyAPI, MassAPI, CollisionAPI}
+
+    class Stage:
+        def GetPrimAtPath(self, path: str) -> Prim:
+            assert path == "/World/cube"
+            return Prim()
+
+    class RigidView:
+        count = 1
+        prim_paths = ["/World/cube"]
+
+        def check(self) -> bool:
+            return True
+
+        def get_velocities(self) -> np.ndarray:
+            return np.asarray([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+
+    class PhysicsView:
+        def create_rigid_body_view(self, path: str) -> RigidView:
+            assert path == "/World/cube"
+            return RigidView()
+
+    class SimulationManager:
+        @staticmethod
+        def get_physics_sim_view() -> PhysicsView:
+            return PhysicsView()
+
+    pxr_module = types.ModuleType("pxr")
+    usd_physics_module = types.ModuleType("pxr.UsdPhysics")
+    usd_physics_module.RigidBodyAPI = RigidBodyAPI
+    usd_physics_module.MassAPI = MassAPI
+    usd_physics_module.CollisionAPI = CollisionAPI
+    pxr_module.UsdPhysics = usd_physics_module
+    isaacsim_module = types.ModuleType("isaacsim")
+    isaacsim_module.__path__ = []
+    isaacsim_core_module = types.ModuleType("isaacsim.core")
+    isaacsim_core_module.__path__ = []
+    simulation_manager_module = types.ModuleType("isaacsim.core.simulation_manager")
+    simulation_manager_module.SimulationManager = SimulationManager
+    monkeypatch.setitem(sys.modules, "pxr", pxr_module)
+    monkeypatch.setitem(sys.modules, "pxr.UsdPhysics", usd_physics_module)
+    monkeypatch.setitem(sys.modules, "isaacsim", isaacsim_module)
+    monkeypatch.setitem(sys.modules, "isaacsim.core", isaacsim_core_module)
+    monkeypatch.setitem(
+        sys.modules, "isaacsim.core.simulation_manager", simulation_manager_module
+    )
+    adapter = v5.IsaacAdapterV5()
+    adapter.get_stage = lambda: Stage()
+
+    result = adapter.get_physics_state("/World/cube")
+
+    assert result.get("velocity_error") is None, result.get("velocity_error")
+    assert result["linear_velocity"] == [1.0, 2.0, 3.0]
+    assert result["angular_velocity"] == [4.0, 5.0, 6.0]
+    assert result["velocity_source"] == "physics_tensor"
+    assert result["velocity_complete"] is True
+    assert result["contacts"] == []
+    assert result["contacts_complete"] is False
+    assert result["contacts_source"] == "use_simulation_step_contact_integrity"
 
 
 def test_atomic_step_runs_exact_updates_and_pauses(monkeypatch) -> None:

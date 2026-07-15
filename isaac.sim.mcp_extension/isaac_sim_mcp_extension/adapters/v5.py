@@ -1062,41 +1062,54 @@ class IsaacAdapterV5(IsaacAdapterBase):
 
         # Check collision
         has_collision = prim.HasAPI(UsdPhysics.CollisionAPI)
-        result["collision_enabled"] = has_collision
+        if has_collision:
+            collision_attr = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr()
+            collision_enabled = (
+                collision_attr.Get()
+                if collision_attr and collision_attr.IsValid()
+                else True
+            )
+            result["collision_enabled"] = bool(collision_enabled)
+        else:
+            result["collision_enabled"] = False
 
         # Get velocities from PhysX runtime API (not USD attributes which may be stale)
         if has_rb:
             try:
-                import omni.physx
+                from isaacsim.core.simulation_manager import SimulationManager
 
-                physx = omni.physx.get_physx_interface()
-                rb_data = physx.get_rigidbody_transformation(prim_path)
-                if rb_data and rb_data.get("ret_val", False):
-                    vel = rb_data.get("linear_velocity", (0.0, 0.0, 0.0))
-                    ang_vel = rb_data.get("angular_velocity", (0.0, 0.0, 0.0))
-                    result["linear_velocity"] = [
-                        float(vel[0]),
-                        float(vel[1]),
-                        float(vel[2]),
-                    ]
-                    result["angular_velocity"] = [
-                        float(ang_vel[0]),
-                        float(ang_vel[1]),
-                        float(ang_vel[2]),
-                    ]
-                else:
-                    result["linear_velocity"] = [0.0, 0.0, 0.0]
-                    result["angular_velocity"] = [0.0, 0.0, 0.0]
-            except Exception:
-                result["linear_velocity"] = [0.0, 0.0, 0.0]
-                result["angular_velocity"] = [0.0, 0.0, 0.0]
+                physics_view = SimulationManager.get_physics_sim_view()
+                if physics_view is None:
+                    raise RuntimeError("PhysX tensor view is unavailable")
+                rigid_view = physics_view.create_rigid_body_view(prim_path)
+                if (
+                    rigid_view is None
+                    or not rigid_view.check()
+                    or rigid_view.count != 1
+                    or list(rigid_view.prim_paths) != [prim_path]
+                ):
+                    raise RuntimeError(
+                        "rigid-body tensor view did not match exact path"
+                    )
+                velocities = np.asarray(rigid_view.get_velocities()).copy()
+                if velocities.shape != (1, 6) or not np.isfinite(velocities).all():
+                    raise RuntimeError("rigid-body tensor velocity is invalid")
+                result["linear_velocity"] = velocities[0, :3].astype(float).tolist()
+                result["angular_velocity"] = velocities[0, 3:].astype(float).tolist()
+                result["velocity_source"] = "physics_tensor"
+                result["velocity_complete"] = True
+            except Exception as exc:
+                result["linear_velocity"] = None
+                result["angular_velocity"] = None
+                result["velocity_source"] = "unavailable"
+                result["velocity_complete"] = False
+                result["velocity_error"] = str(exc)
 
-        # Get contact info if available
-        try:
-            contacts = []
-            result["contacts"] = contacts
-        except Exception:
-            result["contacts"] = []
+        # Contacts are transient. Only atomic step contact_integrity capture can
+        # truthfully report every requested update.
+        result["contacts"] = []
+        result["contacts_complete"] = False
+        result["contacts_source"] = "use_simulation_step_contact_integrity"
 
         return result
 
@@ -1466,6 +1479,7 @@ class IsaacAdapterV5(IsaacAdapterBase):
         budget_ms: Optional[int] = None,
         observe_cap: Optional[int] = None,
         pause_after: bool = False,
+        contact_integrity: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         import omni.kit.app
 
@@ -1480,6 +1494,17 @@ class IsaacAdapterV5(IsaacAdapterBase):
         max_step_frames = 4000
         stepped = 0
         timed_out = False
+        contact_sampler = None
+        contact_trace = None
+        physics_dt_seconds = None
+        if contact_integrity is not None and not pause_after:
+            raise ValueError("contact_integrity requires pause_after=true")
+        if contact_integrity is not None:
+            physics_dt_seconds = float(self.get_simulation_state()["physics_dt"])
+            if not np.isfinite(physics_dt_seconds) or physics_dt_seconds <= 0:
+                raise RuntimeError(
+                    "contact integrity requires a finite positive physics dt"
+                )
         if pause_after:
             if not 0 <= num_steps <= max_step_frames:
                 raise ValueError(
@@ -1493,14 +1518,34 @@ class IsaacAdapterV5(IsaacAdapterBase):
             timeline.commit()
             try:
                 self._ensure_physics_world()
+                if contact_integrity is not None:
+                    from ..contact_integrity import ContactIntegritySampler
+
+                    contact_sampler = ContactIntegritySampler(
+                        self.get_stage(), contact_integrity
+                    )
+                    contact_sampler.validate_request_size(num_steps)
+                    contact_sampler.prepare()
                 timeline.play()
                 timeline.commit()
                 for _ in range(num_steps):
                     omni.kit.app.get_app().update()
                     stepped += 1
+                    if contact_sampler is not None:
+                        contact_sampler.sample(
+                            update_index=stepped - 1,
+                            physics_dt_seconds=float(physics_dt_seconds),
+                        )
             finally:
                 timeline.pause()
                 timeline.commit()
+                if contact_sampler is not None:
+                    contact_sampler.close()
+            if contact_sampler is not None:
+                contact_trace = contact_sampler.result(
+                    requested_updates=num_steps,
+                    physics_dt_seconds=float(physics_dt_seconds),
+                )
         else:
             for _ in range(min(max(0, num_steps), max_step_frames)):
                 if (time.monotonic() - start) * 1000 >= effective_budget_ms:
@@ -1524,6 +1569,8 @@ class IsaacAdapterV5(IsaacAdapterBase):
             )
         if timed_out:
             result["timed_out"] = True
+        if contact_trace is not None:
+            result["contact_integrity"] = contact_trace
 
         # Observe prim states
         if observe_prims:

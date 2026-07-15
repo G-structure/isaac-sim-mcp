@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from ..adapters.base import IsaacAdapterBase
 
@@ -84,6 +84,7 @@ def step(
     budget_ms: Optional[int] = None,
     observe_cap: Optional[int] = None,
     pause_after: bool = False,
+    contact_integrity: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     try:
         result = adapter.step(
@@ -93,6 +94,9 @@ def step(
             budget_ms=budget_ms,
             observe_cap=observe_cap,
             pause_after=pause_after,
+            contact_integrity=(
+                dict(contact_integrity) if contact_integrity is not None else None
+            ),
         )
         # A budget-trip is a graceful PARTIAL result, not a failure. Returning
         # status="timeout" made _execute_command collapse the whole payload to a
