@@ -150,7 +150,7 @@ def test_v5_adapter_owns_initialized_camera_lifecycle():
     assert "self._release_cached_cameras()" in source
 
 
-def test_v5_camera_is_configured_before_runtime_initialization():
+def test_v5_camera_calibration_is_committed_after_runtime_initialization():
     path = os.path.join(EXTENSION_ROOT, "adapters", "v5.py")
     with open(path) as handle:
         source = handle.read()
@@ -161,8 +161,8 @@ def test_v5_camera_is_configured_before_runtime_initialization():
     assert create_source.index("UsdGeom.Camera.Define") < create_source.index(
         "camera.initialize()"
     )
-    assert create_source.index("GetClippingRangeAttr") < create_source.index(
-        "camera.initialize()"
+    assert create_source.index("camera.initialize()") < create_source.index(
+        "GetClippingRangeAttr"
     )
     delete_source = source.split("    def delete_prim", 1)[1].split(
         "    def discover_environments", 1

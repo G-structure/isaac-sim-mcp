@@ -1141,20 +1141,22 @@ class IsaacAdapterV5(IsaacAdapterBase):
             rotation=rotation,
             orientation=orientation,
         )
-        if focal_length is not None:
-            camera_prim.GetFocalLengthAttr().Set(focal_length)
-        if focus_distance is not None:
-            camera_prim.GetFocusDistanceAttr().Set(focus_distance)
-        if horizontal_aperture is not None:
-            camera_prim.GetHorizontalApertureAttr().Set(horizontal_aperture)
-        if vertical_aperture is not None:
-            camera_prim.GetVerticalApertureAttr().Set(vertical_aperture)
-        if clipping_range is not None:
-            camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(*clipping_range))
-
         camera = Camera(prim_path=prim_path, resolution=resolution)
         try:
             camera.initialize()
+            # Camera.initialize() may author runtime defaults on the USD prim.
+            # Commit the requested calibration afterward so the rendered sensor
+            # and its persisted camera contract agree.
+            if focal_length is not None:
+                camera_prim.GetFocalLengthAttr().Set(focal_length)
+            if focus_distance is not None:
+                camera_prim.GetFocusDistanceAttr().Set(focus_distance)
+            if horizontal_aperture is not None:
+                camera_prim.GetHorizontalApertureAttr().Set(horizontal_aperture)
+            if vertical_aperture is not None:
+                camera_prim.GetVerticalApertureAttr().Set(vertical_aperture)
+            if clipping_range is not None:
+                camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(*clipping_range))
         except Exception:
             try:
                 camera.destroy()
