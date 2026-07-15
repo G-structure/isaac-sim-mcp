@@ -157,6 +157,10 @@ The Isaac Sim MCP Extension provides several specialized tools that can be acces
 - **create_robot** - Creates a robot in the scene at a specified position:
   - `robot_type`: Type of robot to create (options: "franka", "jetbot", "carter", "g1", "go1")
   - `position`: [x, y, z] position coordinates
+- **set_joint_positions** - Applies absolute joint targets and reports the
+  `control_source`. Set `require_runtime=true` for evaluation or control loops
+  that must use the live articulation controller and reject the legacy USD
+  drive-target fallback.
 
 ### Omniverse Kit and Scripting
 

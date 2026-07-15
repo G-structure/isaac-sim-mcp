@@ -228,6 +228,7 @@ def set_joints(
     prim_path: Optional[str] = None,
     joint_positions: Optional[Sequence[float]] = None,
     joint_indices: Optional[List[int]] = None,
+    require_runtime: bool = False,
 ) -> Dict[str, Any]:
     try:
         if not prim_path or joint_positions is None:
@@ -235,8 +236,17 @@ def set_joints(
                 "status": "error",
                 "message": "prim_path and joint_positions are required",
             }
-        adapter.set_joint_positions(prim_path, joint_positions, joint_indices)
-        return {"status": "success", "message": f"Set joint positions on {prim_path}"}
+        control_source = adapter.set_joint_positions(
+            prim_path,
+            joint_positions,
+            joint_indices,
+            require_runtime=require_runtime,
+        )
+        return {
+            "status": "success",
+            "message": f"Set joint positions on {prim_path}",
+            "control_source": control_source,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

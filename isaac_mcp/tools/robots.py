@@ -130,6 +130,7 @@ def register_tools(
         prim_path: str,
         joint_positions: List[float],
         joint_indices: Optional[List[int]] = None,
+        require_runtime: bool = False,
     ) -> str:
         """Set target joint positions on a robot via ArticulationAction.
 
@@ -142,10 +143,15 @@ def register_tools(
             prim_path: The prim path of the robot.
             joint_positions: List of target joint position values.
             joint_indices: Optional list of joint indices to set. Sets all joints if not provided.
+            require_runtime: Require live articulation control and reject USD fallback.
         """
         try:
             conn = get_connection()
-            params = {"prim_path": prim_path, "joint_positions": joint_positions}
+            params = {
+                "prim_path": prim_path,
+                "joint_positions": joint_positions,
+                "require_runtime": require_runtime,
+            }
             if joint_indices:
                 params["joint_indices"] = joint_indices
             result = conn.send_command("robots.set_joints", params)
