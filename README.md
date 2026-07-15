@@ -245,10 +245,11 @@ clipped frames.
   and GPU evidence. It recognizes the standard
   `ParticleField3DGaussianSplat` representation and the legacy NuRec
   `Volume` + `OmniNuRecFieldAsset` representation. SPG/PPISP sidecars are
-  detected separately. SPG sessions must launch with `omni.rtx.spg` enabled;
-  before the first Hydra sync the handler delegates all SPG overrides to the
-  installed `isaacsim.replicator.nurec_utils` setup helper. Plain
-  ParticleFields retain the engine tonemapping default.
+  detected separately. Before the first Hydra sync the handler passes every
+  NuRec representation through the installed
+  `isaacsim.replicator.nurec_utils` setup helper. SPG sessions must also launch
+  with `omni.rtx.spg` enabled; plain ParticleFields retain the engine
+  tonemapping default.
 - **inspect_gaussian_splat** repeats the same bounded, read-only evidence pass
   for an existing subtree.
 

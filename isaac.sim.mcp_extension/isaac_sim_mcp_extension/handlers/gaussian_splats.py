@@ -413,34 +413,29 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
 def _configure_renderer_for_asset(app: Any, stage: Any, root: Any) -> Dict[str, Any]:
     """Apply only settings required by representations present in ``root``.
 
-    Plain ParticleFields keep the engine tonemapping default. SPG/PPISP assets
-    require the launch-time SPG extension and every pre-Hydra override owned by
-    the installed NuRec utility. Call this before the first ``app.update()``
-    after the asset is composed.
+    Every ParticleField/NuRec representation goes through the installed NuRec
+    setup helper. Plain ParticleFields keep the engine tonemapping default;
+    SPG/PPISP assets additionally require the launch-time SPG extension and its
+    pre-Hydra overrides. Call this before the first ``app.update()`` after the
+    asset is composed.
     """
     spg_present = has_spg(root)
-    if not spg_present:
-        return {
-            "attempted": True,
-            "asset_mode": "plain_gaussian",
-            "actions": [],
-            "errors": [],
-        }
-
+    asset_mode = "spg_ppisp" if spg_present else "plain_gaussian"
     actions: list[str] = []
     errors: list[str] = []
-    try:
-        extension_manager = app.get_extension_manager()
-        if not extension_manager.is_extension_enabled("omni.rtx.spg"):
-            errors.append(
-                "omni.rtx.spg is not enabled; SPG must be enabled at process launch"
-            )
-    except Exception as exc:
-        errors.append(f"could not inspect omni.rtx.spg launch state: {exc}")
+    if spg_present:
+        try:
+            extension_manager = app.get_extension_manager()
+            if not extension_manager.is_extension_enabled("omni.rtx.spg"):
+                errors.append(
+                    "omni.rtx.spg is not enabled; SPG must be enabled at process launch"
+                )
+        except Exception as exc:
+            errors.append(f"could not inspect omni.rtx.spg launch state: {exc}")
     if errors:
         return {
             "attempted": True,
-            "asset_mode": "spg_ppisp",
+            "asset_mode": asset_mode,
             "actions": actions,
             "errors": errors,
         }
@@ -449,22 +444,24 @@ def _configure_renderer_for_asset(app: Any, stage: Any, root: Any) -> Dict[str, 
             setup_for_rendering,
         )
 
-        success, nurec, spg, problems = setup_for_rendering(stage)
+        success, nurec, utility_spg, problems = setup_for_rendering(stage)
         if not success:
             errors.extend(str(problem) for problem in problems)
-        elif not nurec or not spg:
+        elif not nurec:
             errors.append(
-                "NuRec utility did not classify the composed asset as SPG/PPISP"
+                "NuRec utility did not classify the composed asset as a NuRec representation"
             )
+        elif bool(utility_spg) != spg_present:
+            errors.append("NuRec utility SPG classification disagrees with the asset")
         else:
             actions.append(
-                "applied isaacsim.replicator.nurec_utils pre-Hydra SPG overrides"
+                "applied isaacsim.replicator.nurec_utils pre-Hydra renderer setup"
             )
     except Exception as exc:
         errors.append(f"could not apply NuRec pre-Hydra renderer setup: {exc}")
     return {
         "attempted": True,
-        "asset_mode": "spg_ppisp",
+        "asset_mode": asset_mode,
         "actions": actions,
         "errors": errors,
     }
