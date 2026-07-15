@@ -135,6 +135,7 @@ def _renderer(
     skip_tonemapping: bool = False,
     multi_gpu: bool = False,
     disable_nurec_post: bool = True,
+    spg_setting: bool | None = None,
 ) -> dict[str, Any]:
     return {
         "particle_field_schema_available": True,
@@ -144,6 +145,7 @@ def _renderer(
             "/renderer/multiGpu/enabled": multi_gpu,
             "/rtx/rtpt/gaussian/skipTonemapping/enabled": skip_tonemapping,
             "/omni/rtx/nre/compositing/disableNuRecPostProcessings": disable_nurec_post,
+            "/rtx/spg/enabled": spg if spg_setting is None else spg_setting,
         },
     }
 
@@ -212,20 +214,58 @@ def test_standard_particle_field_proves_counts_ranges_and_renderer() -> None:
     ]
 
 
-def test_standard_particle_field_fails_closed_on_array_mismatch() -> None:
+def test_short_optional_array_uses_default_without_blocking_render() -> None:
     field = _valid_particle_field(scale_count=1)
     root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
 
     report = gaussian_splats._inspect_root(root, renderer=_renderer())
 
-    assert any("scales count 1" in error for error in report["errors"])
+    assert report["errors"] == []
+    assert any("scales count 1" in warning for warning in report["warnings"])
+    assert any("scales is too short" in item for item in report["fidelity_limitations"])
     assert report["particle_fields"][0]["particle_count"] == 2
-    assert (
-        gaussian_splats._readiness_flags(report, runtime_errors=report["errors"])[
-            "schema_ready"
-        ]
-        is False
-    )
+    assert gaussian_splats._readiness_flags(
+        report, runtime_errors=report["errors"]
+    ) == {
+        "schema_ready": True,
+        "render_path_ready": True,
+        "fidelity_ready": False,
+    }
+
+
+def test_long_optional_array_is_truncated_and_ignored_extra_is_not_sampled() -> None:
+    field = _valid_particle_field()
+    field.attributes["scales"].value.append((float("nan"), 1.0, 1.0))
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer())
+
+    assert report["errors"] == []
+    assert any("scales count 3" in warning for warning in report["warnings"])
+    assert any("truncated" in item for item in report["fidelity_limitations"])
+
+
+@pytest.mark.parametrize("coefficient_count", [1, 3])
+def test_sh_length_fallback_or_truncation_does_not_block_render(
+    coefficient_count: int,
+) -> None:
+    field = _valid_particle_field()
+    coefficients = field.attributes["radiance:sphericalHarmonicsCoefficients"]
+    coefficients.value = [(0.2, 0.3, 0.4)] * coefficient_count
+    if coefficient_count > 2:
+        coefficients.value[-1] = (float("nan"), 0.0, 0.0)
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer())
+
+    assert report["errors"] == []
+    assert report["schema_errors"] == []
+    if coefficient_count < 2:
+        assert any("source radiance" in item for item in report["fidelity_errors"])
+        assert any("degree-0 gray fallback" in item for item in report["warnings"])
+    else:
+        assert any("SH coefficient count 3" in item for item in report["warnings"])
+        assert any("SH coefficients" in item for item in report["fidelity_limitations"])
 
 
 def test_standard_particle_field_metadata_is_diagnostic_not_required() -> None:
@@ -290,6 +330,25 @@ def test_optional_orientations_and_scales_use_schema_defaults() -> None:
         "name": None,
         "count": None,
     }
+
+
+def test_empty_optional_arrays_use_schema_defaults() -> None:
+    field = _valid_particle_field()
+    for name in (
+        "orientations",
+        "scales",
+        "opacities",
+        "radiance:sphericalHarmonicsCoefficients",
+    ):
+        field.attributes[name].value = []
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer())
+
+    assert report["schema_errors"] == []
+    assert report["errors"] == []
+    assert any("source opacity" in error for error in report["fidelity_errors"])
+    assert any("source radiance" in error for error in report["fidelity_errors"])
 
 
 def test_nonempty_half_array_wins_over_empty_float_array() -> None:
@@ -419,6 +478,43 @@ def test_spg_requires_nurec_post_processing_to_be_disabled() -> None:
     )
 
     assert any("processed twice" in error for error in report["errors"])
+
+
+@pytest.mark.parametrize(
+    ("renderer", "message"),
+    [
+        ({"spg_setting": False}, "/rtx/spg/enabled=true"),
+        ({"skip_tonemapping": True}, "skipTonemapping/enabled=false"),
+    ],
+)
+def test_spg_required_settings_gate_render_readiness(
+    renderer: dict[str, Any], message: str
+) -> None:
+    field = _valid_particle_field()
+    shader = FakePrim(
+        "/World/GaussianSplat/Render/PPISP",
+        "Shader",
+        attributes=[
+            FakeAttribute(
+                "info:spg:sourceAsset",
+                FakeAssetPath("./ppisp.cu", "/archive/ppisp.cu"),
+            )
+        ],
+    )
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field, shader])
+
+    report = gaussian_splats._inspect_root(
+        root,
+        renderer=_renderer(spg=True, **renderer),
+    )
+
+    assert any(message in error for error in report["errors"])
+    assert (
+        gaussian_splats._readiness_flags(report, runtime_errors=report["errors"])[
+            "render_path_ready"
+        ]
+        is False
+    )
 
 
 def test_plain_particle_field_uses_nurec_setup_without_forcing_tonemapping(
