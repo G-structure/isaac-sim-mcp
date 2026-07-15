@@ -101,7 +101,11 @@ def inspect_root(root: Any, *, renderer: Dict[str, Any]) -> Dict[str, Any]:
         warnings.append(
             "Fabric Scene Delegate is not explicitly enabled; Kit 110.1 is the supported ParticleField path"
         )
-    if settings.get("/renderer/multiGpu/enabled") is not False:
+    if representations and settings.get("/renderer/multiGpu/enabled") is True:
+        errors.append(
+            "Multi-GPU rendering is enabled; Gaussian rendering requires /renderer/multiGpu/enabled=false"
+        )
+    elif representations and settings.get("/renderer/multiGpu/enabled") is not False:
         warnings.append(
             "Multi-GPU rendering is not explicitly disabled; single-GPU Gaussian sessions are the tested path"
         )
@@ -111,6 +115,14 @@ def inspect_root(root: Any, *, renderer: Dict[str, Any]) -> Dict[str, Any]:
     ):
         warnings.append(
             "SPG/PPISP is present but Gaussian skip-tonemapping is not explicitly false; output color may diverge from the asset"
+        )
+    if (
+        spg["present"]
+        and settings.get("/omni/rtx/nre/compositing/disableNuRecPostProcessings")
+        is not True
+    ):
+        errors.append(
+            "SPG/PPISP is present but NuRec post-processing is not disabled; PPISP output would be processed twice"
         )
 
     render_prim_paths = [
@@ -168,9 +180,9 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
     attributes: Dict[str, Dict[str, Any]] = {}
 
     for logical_name, aliases in _PARTICLE_ATTRIBUTES.items():
-        attr, value = _first_authored_attribute(prim, aliases)
+        attr, value = _first_nonempty_authored_attribute(prim, aliases)
         if attr is None or value is None:
-            if logical_name in {"positions", "orientations", "scales"}:
+            if logical_name == "positions":
                 errors.append(
                     f"{path}: required Gaussian attribute {logical_name} is not authored"
                 )
@@ -228,7 +240,7 @@ def _validate_particle_field(prim: Any) -> Dict[str, Any]:
         except (TypeError, ValueError):
             errors.append(f"{path}: spherical harmonics degree is not an integer")
 
-    coefficient_attr, coefficients = _first_authored_attribute(
+    coefficient_attr, coefficients = _first_nonempty_authored_attribute(
         prim, _PARTICLE_ATTRIBUTES["sh_coefficients"]
     )
     element_size = None
@@ -486,6 +498,36 @@ def _first_authored_attribute(prim: Any, names: Sequence[str]) -> tuple[Any, Any
         if value is not None:
             return attr, value
     return None, None
+
+
+def _first_nonempty_authored_attribute(
+    prim: Any, names: Sequence[str]
+) -> tuple[Any, Any]:
+    """Prefer an authored non-empty float array, then its half alias.
+
+    OpenUSD's ParticleField APIs select float storage only when it contains at
+    least one value. Preserve the first authored empty array as a diagnostic
+    fallback when no alias contains data.
+    """
+    fallback: tuple[Any, Any] = (None, None)
+    for name in names:
+        attr = prim.GetAttribute(name)
+        if not attr:
+            continue
+        has_authored = getattr(attr, "HasAuthoredValueOpinion", None)
+        if callable(has_authored) and not has_authored():
+            continue
+        value = attr.Get()
+        if value is None:
+            continue
+        if fallback[0] is None:
+            fallback = (attr, value)
+        try:
+            if len(value) > 0:
+                return attr, value
+        except TypeError:
+            return attr, value
+    return fallback
 
 
 def attribute_value(prim: Any, name: str) -> Any:

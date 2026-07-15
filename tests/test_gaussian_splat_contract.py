@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_ROOT = REPO_ROOT / "isaac.sim.mcp_extension" / "isaac_sim_mcp_extension"
@@ -107,14 +109,21 @@ class FakeAssetPath:
         self.resolvedPath = resolved_path
 
 
-def _renderer(*, spg: bool = False, skip_tonemapping: bool = False) -> dict[str, Any]:
+def _renderer(
+    *,
+    spg: bool = False,
+    skip_tonemapping: bool = False,
+    multi_gpu: bool = False,
+    disable_nurec_post: bool = True,
+) -> dict[str, Any]:
     return {
         "particle_field_schema_available": True,
         "extensions": {"omni.hydra.rtx": True, "omni.rtx.spg": spg},
         "settings": {
             "/app/useFabricSceneDelegate": True,
-            "/renderer/multiGpu/enabled": False,
+            "/renderer/multiGpu/enabled": multi_gpu,
             "/rtx/rtpt/gaussian/skipTonemapping/enabled": skip_tonemapping,
+            "/omni/rtx/nre/compositing/disableNuRecPostProcessings": disable_nurec_post,
         },
     }
 
@@ -243,6 +252,59 @@ def test_optional_schema_fallbacks_do_not_claim_source_fidelity() -> None:
     }
 
 
+def test_optional_orientations_and_scales_use_schema_defaults() -> None:
+    field = _valid_particle_field()
+    field.attributes.pop("orientations")
+    field.attributes.pop("scales")
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer())
+
+    assert report["schema_errors"] == []
+    assert report["errors"] == []
+    assert report["particle_fields"][0]["attributes"]["orientations"] == {
+        "name": None,
+        "count": None,
+    }
+    assert report["particle_fields"][0]["attributes"]["scales"] == {
+        "name": None,
+        "count": None,
+    }
+
+
+def test_nonempty_half_array_wins_over_empty_float_array() -> None:
+    field = _valid_particle_field()
+    positions = field.attributes["positions"].value
+    field.attributes["positions"].value = []
+    field.attributes["positionsh"] = FakeAttribute(
+        "positionsh", positions, type_name="point3h[]"
+    )
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer())
+
+    assert report["errors"] == []
+    assert report["particle_fields"][0]["particle_count"] == 2
+    assert report["particle_fields"][0]["attributes"]["positions"]["name"] == (
+        "positionsh"
+    )
+
+
+def test_enabled_multi_gpu_fails_render_readiness() -> None:
+    field = _valid_particle_field()
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    report = gaussian_splats._inspect_root(root, renderer=_renderer(multi_gpu=True))
+
+    assert any("Multi-GPU rendering is enabled" in error for error in report["errors"])
+    assert (
+        gaussian_splats._readiness_flags(report, runtime_errors=report["errors"])[
+            "render_path_ready"
+        ]
+        is False
+    )
+
+
 def test_legacy_nurec_volume_reports_opaque_payload_without_guessing_count() -> None:
     density = FakePrim(
         "/World/GaussianSplat/gauss/density_field",
@@ -317,11 +379,35 @@ def test_spg_sidecars_require_the_runtime_extension() -> None:
     assert enabled["spg"]["errors"] == []
 
 
+def test_spg_requires_nurec_post_processing_to_be_disabled() -> None:
+    field = _valid_particle_field()
+    shader = FakePrim(
+        "/World/GaussianSplat/Render/PPISP",
+        "Shader",
+        attributes=[
+            FakeAttribute(
+                "info:spg:sourceAsset",
+                FakeAssetPath("./ppisp.cu", "/archive/ppisp.cu"),
+            )
+        ],
+    )
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field, shader])
+
+    report = gaussian_splats._inspect_root(
+        root,
+        renderer=_renderer(spg=True, disable_nurec_post=False),
+    )
+
+    assert any("processed twice" in error for error in report["errors"])
+
+
 def test_plain_particle_field_keeps_renderer_tonemapping_policy() -> None:
     field = _valid_particle_field()
     root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
 
-    configuration = gaussian_splats._configure_renderer_for_asset(object(), root)
+    configuration = gaussian_splats._configure_renderer_for_asset(
+        object(), object(), root
+    )
     report = gaussian_splats._inspect_root(
         root,
         renderer=_renderer(skip_tonemapping=True),
@@ -334,6 +420,133 @@ def test_plain_particle_field_keeps_renderer_tonemapping_policy() -> None:
         "errors": [],
     }
     assert not any("tonemapping" in warning for warning in report["warnings"])
+
+
+def test_spg_setup_uses_installed_nurec_utility(monkeypatch) -> None:
+    field = _valid_particle_field()
+    shader = FakePrim(
+        "/World/GaussianSplat/Render/PPISP",
+        "Shader",
+        attributes=[
+            FakeAttribute(
+                "info:spg:sourceAsset",
+                FakeAssetPath("./ppisp.cu", "/archive/ppisp.cu"),
+            )
+        ],
+    )
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field, shader])
+    stage = object()
+    calls: list[Any] = []
+
+    class Extensions:
+        def is_extension_enabled(self, name: str) -> bool:
+            calls.append(("extension", name))
+            return True
+
+    class App:
+        def get_extension_manager(self) -> Extensions:
+            return Extensions()
+
+    rendering_setup = types.ModuleType(
+        "isaacsim.replicator.nurec_utils.rendering_setup"
+    )
+
+    def setup_for_rendering(received_stage: Any):
+        calls.append(("setup", received_stage))
+        return True, True, True, []
+
+    rendering_setup.setup_for_rendering = setup_for_rendering
+    for name in (
+        "isaacsim",
+        "isaacsim.replicator",
+        "isaacsim.replicator.nurec_utils",
+    ):
+        package = types.ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setitem(
+        sys.modules,
+        "isaacsim.replicator.nurec_utils.rendering_setup",
+        rendering_setup,
+    )
+
+    configuration = gaussian_splats._configure_renderer_for_asset(App(), stage, root)
+
+    assert configuration["errors"] == []
+    assert "pre-Hydra" in configuration["actions"][0]
+    assert calls == [("extension", "omni.rtx.spg"), ("setup", stage)]
+
+
+def test_runtime_configures_before_waiting_for_stage(monkeypatch) -> None:
+    app = object()
+    context = object()
+    root = object()
+    stage = SimpleNamespace(GetPrimAtPath=lambda _path: root)
+    events: list[str] = []
+
+    app_module = types.ModuleType("omni.kit.app")
+    app_module.get_app = lambda: app
+    usd_module = types.ModuleType("omni.usd")
+    usd_module.get_context = lambda: context
+    kit_module = types.ModuleType("omni.kit")
+    kit_module.__path__ = []
+    kit_module.app = app_module
+    omni_module = types.ModuleType("omni")
+    omni_module.__path__ = []
+    omni_module.kit = kit_module
+    omni_module.usd = usd_module
+    for name, module in (
+        ("omni", omni_module),
+        ("omni.kit", kit_module),
+        ("omni.kit.app", app_module),
+        ("omni.usd", usd_module),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_configure_renderer_for_asset",
+        lambda *_args: events.append("configure") or {"attempted": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_wait_for_stage",
+        lambda *_args, **_kwargs: events.append("wait") or {"complete": True},
+    )
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_renderer_evidence",
+        lambda _app: {"extensions": {}, "settings": {}},
+    )
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_inspect_root",
+        lambda *_args, **_kwargs: {
+            "errors": [],
+            "warnings": [],
+            "schema_errors": [],
+            "fidelity_errors": [],
+            "fidelity_limitations": [],
+            "render_prim_paths": [],
+        },
+    )
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_measure_update_loop",
+        lambda *_args, **_kwargs: {"measured": False},
+    )
+    monkeypatch.setattr(gaussian_splats, "_gpu_evidence", lambda: {})
+
+    gaussian_splats._runtime_evidence(
+        stage=stage,
+        root_path="/World/Scan",
+        configure_renderer=True,
+        frame_camera=False,
+        wait_timeout_seconds=1.0,
+        warmup_frames=0,
+        sample_frames=0,
+    )
+
+    assert events == ["configure", "wait"]
 
 
 def test_presigned_source_is_never_echoed_with_query_or_fragment() -> None:
@@ -469,3 +682,63 @@ def test_handler_registration_keeps_the_asset_namespace() -> None:
         "assets.load_gaussian_splat",
         "assets.inspect_gaussian_splat",
     }
+
+
+def test_asset_reference_uses_an_untyped_override_without_pxr() -> None:
+    class References:
+        sources: list[str] = []
+
+        def AddReference(self, source: str) -> bool:
+            self.sources.append(source)
+            return True
+
+    class Prim:
+        references = References()
+
+        def GetReferences(self) -> References:
+            return self.references
+
+    class Stage:
+        override_paths: list[str] = []
+
+        def OverridePrim(self, path: str) -> Prim:
+            self.override_paths.append(path)
+            return Prim()
+
+        def DefinePrim(self, *_args, **_kwargs):
+            raise AssertionError(
+                "a local type opinion would mask the referenced schema"
+            )
+
+    stage = Stage()
+    root = gaussian_splats._author_asset_reference(
+        stage,
+        "/World/Scan",
+        "/data/workspace/scan.usdz",
+    )
+
+    assert isinstance(root, Prim)
+    assert stage.override_paths == ["/World/Scan"]
+    assert root.references.sources == ["/data/workspace/scan.usdz"]
+
+
+def test_untyped_reference_preserves_converter_default_prim_schema(tmp_path) -> None:
+    Usd = pytest.importorskip("pxr.Usd")
+    source_path = tmp_path / "converter-shaped.usdc"
+    source_stage = Usd.Stage.CreateNew(str(source_path))
+    source_prim = source_stage.DefinePrim(
+        "/GaussianSplat", "ParticleField3DGaussianSplat"
+    )
+    source_stage.SetDefaultPrim(source_prim)
+    source_stage.GetRootLayer().Save()
+
+    target_stage = Usd.Stage.CreateInMemory()
+    target_stage.DefinePrim("/World", "Xform")
+    gaussian_splats._author_asset_reference(
+        target_stage,
+        "/World/Scan",
+        str(source_path),
+    )
+
+    composed = target_stage.GetPrimAtPath("/World/Scan")
+    assert composed.GetTypeName() == "ParticleField3DGaussianSplat"

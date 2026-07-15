@@ -245,9 +245,10 @@ clipped frames.
   and GPU evidence. It recognizes the standard
   `ParticleField3DGaussianSplat` representation and the legacy NuRec
   `Volume` + `OmniNuRecFieldAsset` representation. SPG/PPISP sidecars are
-  detected separately; only those assets enable `omni.rtx.spg` and force the
-  documented Gaussian tonemapping override. Plain ParticleFields keep the
-  engine default.
+  detected separately. SPG sessions must launch with `omni.rtx.spg` enabled;
+  before the first Hydra sync the handler delegates all SPG overrides to the
+  installed `isaacsim.replicator.nurec_utils` setup helper. Plain
+  ParticleFields retain the engine tonemapping default.
 - **inspect_gaussian_splat** repeats the same bounded, read-only evidence pass
   for an existing subtree.
 
@@ -257,9 +258,10 @@ correct pixels. The response makes that boundary explicit with
 `pixel_proof`.
 Review a CUA/viewport image and compare the scene with the returned
 `pixel_proof.render_prim_paths` visible and hidden before claiming visual
-correctness. ParticleField validation checks required geometry arrays, matching
-authored counts, SH degree/coefficient shape, sampled finite/range constraints,
-and bounds. Standards-compliant missing SH or opacity data can still pass
+correctness. ParticleField validation checks positions, matching authored array
+counts, SH degree/coefficient shape, sampled finite/range constraints, and
+bounds. Optional orientations and scales retain their schema defaults.
+Standards-compliant missing SH or opacity data can still pass
 `schema_ready` and `render_path_ready` because OpenUSD defines gray and fully
 opaque fallbacks, but it fails `fidelity_ready`: source color/opacity has not
 been proven. SH `elementSize` and `interpolation` metadata are reported when
