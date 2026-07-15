@@ -232,10 +232,11 @@ live velocity is unavailable. Its `contacts` field is intentionally marked
   without changing the sensor pose, projection, or captured observations.
 - **capture_image** - Captures RGB from an initialized camera, optionally to an artifact path.
 
-Camera pose and projection attributes are authored before the runtime render
-product initializes. Replacing a camera or deleting its prim destroys the
-cached wrapper first, preventing stale render products from returning blank or
-clipped frames.
+Camera pose is authored before the runtime render product initializes. Camera
+projection attributes are committed afterward because runtime initialization
+may author default optics on the USD prim. Replacing a camera or deleting its
+prim destroys the cached wrapper first, preventing stale render products from
+returning blank or clipped frames.
 
 ### Gaussian Splats / NuRec
 

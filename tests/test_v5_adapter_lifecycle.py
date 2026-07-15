@@ -68,6 +68,7 @@ class FakePrim:
 class FakeStage:
     def __init__(self) -> None:
         self.prims: dict[str, FakePrim] = {}
+        self.camera_prims: dict[str, FakeCameraPrim] = {}
 
     def GetPrimAtPath(self, prim_path: str) -> FakePrim:
         return self.prims[prim_path]
@@ -161,7 +162,7 @@ def _install_fake_pxr(monkeypatch, stage: FakeStage) -> None:
         @staticmethod
         def Define(_stage: FakeStage, prim_path: str) -> FakeCameraPrim:
             stage.prims.setdefault(prim_path, FakePrim())
-            return FakeCameraPrim()
+            return stage.camera_prims.setdefault(prim_path, FakeCameraPrim())
 
     usd_geom = types.SimpleNamespace(
         Camera=Camera,
@@ -278,3 +279,68 @@ def test_camera_resolution_survives_stop_play_recreation(monkeypatch) -> None:
     assert recreated.resolution == (640, 360)
     assert image.shape == (1, 1, 4)
     assert timeline_events == ["stop", "play"]
+
+
+def test_camera_calibration_is_committed_after_runtime_initialization(
+    monkeypatch,
+) -> None:
+    stage = FakeStage()
+    prim_path = "/World/policy_camera"
+    stage.prims[prim_path] = FakePrim()
+    _install_fake_pxr(monkeypatch, stage)
+
+    runtime_defaults = {
+        "focal_length": 50.0,
+        "focus_distance": 5.0,
+        "horizontal_aperture": 20.955,
+        "vertical_aperture": 15.2908,
+        "clipping_range": (1.0, 1_000_000.0),
+    }
+
+    class RuntimeCamera:
+        def __init__(self, *, prim_path: str, resolution: tuple[int, int]) -> None:
+            self.prim_path = prim_path
+            self.resolution = resolution
+
+        def initialize(self) -> None:
+            camera_prim = stage.camera_prims[self.prim_path]
+            for name, value in runtime_defaults.items():
+                getattr(camera_prim, name).Set(value)
+
+        @staticmethod
+        def destroy() -> None:
+            pass
+
+    camera_module = types.ModuleType("isaacsim.sensors.camera")
+    camera_module.Camera = RuntimeCamera
+    sensors_module = types.ModuleType("isaacsim.sensors")
+    sensors_module.__path__ = []
+    sensors_module.camera = camera_module
+    isaacsim_module = types.ModuleType("isaacsim")
+    isaacsim_module.__path__ = []
+    isaacsim_module.sensors = sensors_module
+    for name, module in {
+        "isaacsim": isaacsim_module,
+        "isaacsim.sensors": sensors_module,
+        "isaacsim.sensors.camera": camera_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    adapter = v5.IsaacAdapterV5()
+    adapter.get_stage = lambda: stage
+    adapter.create_camera(
+        prim_path,
+        resolution=(640, 360),
+        focal_length=2.1,
+        focus_distance=28.0,
+        horizontal_aperture=5.376,
+        vertical_aperture=3.024,
+        clipping_range=(0.01, 1_000_000.0),
+    )
+
+    camera_prim = stage.camera_prims[prim_path]
+    assert camera_prim.focal_length.value == 2.1
+    assert camera_prim.focus_distance.value == 28.0
+    assert camera_prim.horizontal_aperture.value == 5.376
+    assert camera_prim.vertical_aperture.value == 3.024
+    assert camera_prim.clipping_range.value == (0.01, 1_000_000.0)
