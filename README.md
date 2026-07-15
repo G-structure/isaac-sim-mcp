@@ -250,8 +250,10 @@ clipped frames.
   `isaacsim.replicator.nurec_utils` setup helper. SPG sessions must also launch
   with `omni.rtx.spg` enabled; plain ParticleFields retain the engine
   tonemapping default.
-- **inspect_gaussian_splat** repeats the same bounded, read-only evidence pass
-  for an existing subtree.
+- **inspect_gaussian_splat** repeats the same bounded evidence pass for an
+  existing subtree. It pumps bounded Kit updates while waiting and sampling,
+  so the hosted gateway treats it as a write-scoped operation even when camera
+  framing is disabled.
 
 Treat `ready=true` as a USD-composition and renderer-path result, not proof of
 correct pixels. The response makes that boundary explicit with

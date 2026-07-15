@@ -810,6 +810,33 @@ def test_handler_registration_keeps_the_asset_namespace() -> None:
     }
 
 
+def test_renderer_evidence_reports_the_dlss_frame_generation_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Settings:
+        def get(self, path: str) -> object:
+            return path == "/app/useFabricSceneDelegate"
+
+    carb = types.ModuleType("carb")
+    carb.settings = types.SimpleNamespace(get_settings=lambda: Settings())
+    monkeypatch.setitem(sys.modules, "carb", carb)
+    monkeypatch.setattr(
+        gaussian_splats,
+        "_particle_field_schema_evidence",
+        lambda: {"particle_field_schema_available": True},
+    )
+
+    class ExtensionManager:
+        def is_extension_enabled(self, _name: str) -> bool:
+            return True
+
+    app = types.SimpleNamespace(get_extension_manager=lambda: ExtensionManager())
+
+    evidence = gaussian_splats._renderer_evidence(app)
+
+    assert evidence["settings"]["/rtx-transient/dlssg/enabled"] is False
+
+
 def test_asset_reference_uses_an_untyped_override_without_pxr() -> None:
     class References:
         sources: list[str] = []
