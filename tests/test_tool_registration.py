@@ -36,6 +36,7 @@ EXPECTED_MODULES = [
     "sensors.py",
     "materials.py",
     "assets.py",
+    "gaussian_splats.py",
     "simulation.py",
 ]
 
@@ -51,13 +52,29 @@ def test_all_tool_modules_have_register_tools():
         path = os.path.join(TOOLS_DIR, filename)
         with open(path) as f:
             tree = ast.parse(f.read())
-        func_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-        assert "register_tools" in func_names, f"{filename} missing register_tools() function"
+        func_names = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        assert "register_tools" in func_names, (
+            f"{filename} missing register_tools() function"
+        )
 
 
 def test_init_imports_all_modules():
     path = os.path.join(TOOLS_DIR, "__init__.py")
     with open(path) as f:
         content = f.read()
-    for module_name in ["scene", "objects", "lighting", "robots", "sensors", "materials", "assets", "simulation"]:
-        assert module_name in content, f"tools/__init__.py missing import of {module_name}"
+    for module_name in [
+        "scene",
+        "objects",
+        "lighting",
+        "robots",
+        "sensors",
+        "materials",
+        "assets",
+        "gaussian_splats",
+        "simulation",
+    ]:
+        assert module_name in content, (
+            f"tools/__init__.py missing import of {module_name}"
+        )
