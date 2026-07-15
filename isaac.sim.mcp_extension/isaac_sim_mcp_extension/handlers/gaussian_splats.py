@@ -389,12 +389,7 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
     except Exception:
         settings = {path: None for path in settings_paths}
 
-    try:
-        from pxr import UsdVol
-
-        schema_available = hasattr(UsdVol, _STANDARD_TYPE)
-    except Exception:
-        schema_available = False
+    schema_evidence = _particle_field_schema_evidence()
     version_path = Path("/isaac-sim/VERSION")
     version = None
     try:
@@ -404,9 +399,32 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
         pass
     return {
         "isaac_sim_version": version,
-        "particle_field_schema_available": schema_available,
+        **schema_evidence,
         "extensions": extensions,
         "settings": settings,
+    }
+
+
+def _particle_field_schema_evidence() -> Dict[str, bool]:
+    """Probe the codeless schema registry independently of Python bindings.
+
+    Isaac Sim 6.0.1 ships a pre-26.03 OpenUSD Python module and supplies the
+    ParticleField schema through ``omni.usd.schema.usd_particle_field``. The
+    registered concrete prim definition is therefore the render-path signal;
+    ``pxr.UsdVol`` class generation is only diagnostic.
+    """
+    try:
+        from pxr import Usd, UsdVol
+
+        definition = Usd.SchemaRegistry().FindConcretePrimDefinition(_STANDARD_TYPE)
+        schema_available = definition is not None
+        python_binding_available = hasattr(UsdVol, _STANDARD_TYPE)
+    except Exception:
+        schema_available = False
+        python_binding_available = False
+    return {
+        "particle_field_schema_available": schema_available,
+        "particle_field_python_binding_available": python_binding_available,
     }
 
 
