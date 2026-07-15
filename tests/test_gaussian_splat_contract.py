@@ -134,6 +134,7 @@ def _renderer(
     spg: bool = False,
     skip_tonemapping: bool = False,
     multi_gpu: bool = False,
+    dlssg: bool | None = False,
     disable_nurec_post: bool = True,
     spg_setting: bool | None = None,
 ) -> dict[str, Any]:
@@ -143,6 +144,7 @@ def _renderer(
         "settings": {
             "/app/useFabricSceneDelegate": True,
             "/renderer/multiGpu/enabled": multi_gpu,
+            "/rtx-transient/dlssg/enabled": dlssg,
             "/rtx/rtpt/gaussian/skipTonemapping/enabled": skip_tonemapping,
             "/omni/rtx/nre/compositing/disableNuRecPostProcessings": disable_nurec_post,
             "/rtx/spg/enabled": spg if spg_setting is None else spg_setting,
@@ -382,6 +384,23 @@ def test_enabled_multi_gpu_fails_render_readiness() -> None:
         ]
         is False
     )
+
+
+def test_dlss_frame_generation_must_be_explicitly_disabled() -> None:
+    field = _valid_particle_field()
+    root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+
+    enabled = gaussian_splats._inspect_root(root, renderer=_renderer(dlssg=True))
+    unknown = gaussian_splats._inspect_root(root, renderer=_renderer(dlssg=None))
+    disabled = gaussian_splats._inspect_root(root, renderer=_renderer(dlssg=False))
+
+    assert any("DLSS frame generation is enabled" in error for error in enabled["errors"])
+    assert any(
+        "DLSS frame generation is not explicitly disabled" in warning
+        for warning in unknown["warnings"]
+    )
+    assert not any("DLSS frame generation" in item for item in disabled["errors"])
+    assert not any("DLSS frame generation" in item for item in disabled["warnings"])
 
 
 def test_legacy_nurec_volume_reports_opaque_payload_without_guessing_count() -> None:

@@ -109,6 +109,14 @@ def inspect_root(root: Any, *, renderer: Dict[str, Any]) -> Dict[str, Any]:
         warnings.append(
             "Multi-GPU rendering is not explicitly disabled; single-GPU Gaussian sessions are the tested path"
         )
+    if representations and settings.get("/rtx-transient/dlssg/enabled") is True:
+        errors.append(
+            "DLSS frame generation is enabled; Gaussian rendering requires /rtx-transient/dlssg/enabled=false"
+        )
+    elif representations and settings.get("/rtx-transient/dlssg/enabled") is not False:
+        warnings.append(
+            "DLSS frame generation is not explicitly disabled; reconstructed frames are not accepted for Gaussian evidence"
+        )
     if (
         spg["present"]
         and settings.get("/rtx/rtpt/gaussian/skipTonemapping/enabled") is not False
