@@ -377,6 +377,7 @@ def _renderer_evidence(app: Any) -> Dict[str, Any]:
     settings_paths = (
         "/app/useFabricSceneDelegate",
         "/renderer/multiGpu/enabled",
+        "/rtx-transient/dlssg/enabled",
         "/rtx/rtpt/gaussian/skipTonemapping/enabled",
         "/rtx/spg/enabled",
         "/omni/rtx/nre/compositing/disableNuRecPostProcessings",
