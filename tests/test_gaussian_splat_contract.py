@@ -716,6 +716,24 @@ def test_gpu_evidence_reports_free_memory_and_utilization_ratio(monkeypatch) -> 
     }
 
 
+def test_codeless_particle_field_schema_does_not_require_python_binding(
+    monkeypatch,
+) -> None:
+    class Registry:
+        def FindConcretePrimDefinition(self, type_name: str) -> object | None:
+            return object() if type_name == "ParticleField3DGaussianSplat" else None
+
+    pxr_module = types.ModuleType("pxr")
+    pxr_module.Usd = SimpleNamespace(SchemaRegistry=lambda: Registry())
+    pxr_module.UsdVol = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "pxr", pxr_module)
+
+    assert gaussian_splats._particle_field_schema_evidence() == {
+        "particle_field_schema_available": True,
+        "particle_field_python_binding_available": False,
+    }
+
+
 class RecordingMCP:
     def __init__(self) -> None:
         self.tools: dict[str, Any] = {}
