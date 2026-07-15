@@ -248,9 +248,12 @@ class ContactIntegritySampler:
         )
         count = int(counts.reshape(-1)[0])
         start = int(starts.reshape(-1)[0])
-        if count < 0 or start < 0 or start + count > len(points):
-            raise RuntimeError("contact tensor returned invalid buffer indexes")
-        saturated = count >= self.config.max_contacts_per_pair
+        contact_start, captured_count, saturated = self._bounded_tensor_window(
+            kind="contact",
+            count=count,
+            start=start,
+            buffer_lengths=(len(forces), len(points), len(normals), len(distances)),
+        )
         if saturated:
             self._saturated_pairs.add(pair.label)
 
@@ -258,7 +261,7 @@ class ContactIntegritySampler:
         total_normal_impulse = 0.0
         maximum_penetration = 0.0
         maximum_normal_impulse = 0.0
-        for index in range(start, start + count):
+        for index in range(contact_start, contact_start + captured_count):
             impulse = _finite_float(forces[index], "normal impulse")
             if impulse < 0:
                 raise RuntimeError("contact telemetry emitted negative normal impulse")
@@ -290,16 +293,23 @@ class ContactIntegritySampler:
             )
             friction_count = int(friction_counts.reshape(-1)[0])
             friction_start = int(friction_starts.reshape(-1)[0])
-            if (
-                friction_count < 0
-                or friction_start < 0
-                or friction_start + friction_count > len(friction_points)
-            ):
-                raise RuntimeError("friction tensor returned invalid buffer indexes")
-            if friction_count >= self.config.max_contacts_per_pair:
+            (
+                friction_start,
+                captured_friction_count,
+                friction_saturated,
+            ) = self._bounded_tensor_window(
+                kind="friction",
+                count=friction_count,
+                start=friction_start,
+                buffer_lengths=(len(impulses), len(friction_points)),
+            )
+            if friction_saturated:
                 saturated = True
                 self._saturated_pairs.add(pair.label)
-            for index in range(friction_start, friction_start + friction_count):
+            for index in range(
+                friction_start,
+                friction_start + captured_friction_count,
+            ):
                 vector = _finite_vector(impulses[index], "friction impulse")
                 friction_contacts.append(
                     {
@@ -326,6 +336,33 @@ class ContactIntegritySampler:
             "maximum_normal_impulse_ns": maximum_normal_impulse,
             "total_normal_impulse_ns": total_normal_impulse,
         }
+
+    def _bounded_tensor_window(
+        self,
+        *,
+        kind: str,
+        count: int,
+        start: int,
+        buffer_lengths: tuple[int, ...],
+    ) -> tuple[int, int, bool]:
+        """Return the readable prefix while distinguishing overflow from corruption."""
+
+        if count < 0 or not buffer_lengths or min(buffer_lengths) < 0:
+            raise RuntimeError(f"{kind} tensor returned invalid buffer indexes")
+        shortest_buffer = min(buffer_lengths)
+        saturated = count >= self.config.max_contacts_per_pair
+        if start < 0:
+            if saturated:
+                return 0, 0, True
+            raise RuntimeError(f"{kind} tensor returned invalid buffer indexes")
+        available = shortest_buffer - start
+        if available < 0:
+            raise RuntimeError(f"{kind} tensor returned invalid buffer indexes")
+        if count <= available:
+            return start, count, saturated
+        if saturated:
+            return start, available, True
+        raise RuntimeError(f"{kind} tensor returned invalid buffer indexes")
 
     def _record_limit_violations(
         self,

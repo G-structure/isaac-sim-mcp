@@ -195,6 +195,9 @@ reported friction impulse. Negative separation means interpenetration. The
 trace reports `complete=false` on a missing tensor view, non-finite data, a
 missing update, or a full contact buffer. Contact capture requires atomic mode
 because PhysX reuses contact buffers after the next physics update. When
+PhysX reports more manifold points than the configured buffer can hold, the
+trace preserves the readable bounded prefix and names the pair in
+`saturated_pairs`; callers must still reject the incomplete trace. When
 `limits` are present, `within_configured_limits` and `violations` provide a
 machine-readable physics-quality verdict without relying on rendered frames.
 The product of updates, pairs, and per-pair capacity may not exceed 8192 contact

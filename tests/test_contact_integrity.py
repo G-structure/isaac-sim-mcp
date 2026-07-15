@@ -30,19 +30,27 @@ class FakeContactView:
         separation: float = -0.003,
         normal_impulse: float = 2.0,
         count: int = 1,
+        buffer_count: int | None = None,
+        friction_count: int = 1,
+        friction_buffer_count: int | None = None,
     ) -> None:
         self.separation = separation
         self.normal_impulse = normal_impulse
         self.count = count
+        self.buffer_count = count if buffer_count is None else buffer_count
+        self.friction_count = friction_count
+        self.friction_buffer_count = (
+            friction_count if friction_buffer_count is None else friction_buffer_count
+        )
         self.destroyed = False
 
     def get_contact_force_data(self, dt: float):
         assert dt == 1.0
         return (
-            np.full((self.count, 1), self.normal_impulse),
-            np.zeros((self.count, 3)),
-            np.tile(np.array([[0.0, 0.0, 1.0]]), (self.count, 1)),
-            np.full((self.count, 1), self.separation),
+            np.full((self.buffer_count, 1), self.normal_impulse),
+            np.zeros((self.buffer_count, 3)),
+            np.tile(np.array([[0.0, 0.0, 1.0]]), (self.buffer_count, 1)),
+            np.full((self.buffer_count, 1), self.separation),
             np.array([[self.count]]),
             np.array([[0]]),
         )
@@ -50,9 +58,12 @@ class FakeContactView:
     def get_friction_data(self, dt: float):
         assert dt == 1.0
         return (
-            np.array([[0.1, 0.0, 0.0]]),
-            np.zeros((1, 3)),
-            np.array([[1]]),
+            np.tile(
+                np.array([[0.1, 0.0, 0.0]]),
+                (self.friction_buffer_count, 1),
+            ),
+            np.zeros((self.friction_buffer_count, 3)),
+            np.array([[self.friction_count]]),
             np.array([[0]]),
         )
 
@@ -166,6 +177,41 @@ def test_full_contact_buffer_invalidates_trace() -> None:
     assert result["complete"] is False
     assert result["saturated_pairs"] == ["left-cube"]
     assert result["samples"][0]["pairs"][0]["buffer_saturated"] is True
+
+
+def test_physx_count_beyond_allocated_buffer_is_saturation() -> None:
+    sampler = _sampler(
+        max_contacts=1,
+        view=FakeContactView(count=4, buffer_count=1),
+    )
+
+    sampler.sample(update_index=0, physics_dt_seconds=1.0 / 120.0)
+    result = sampler.result(requested_updates=1, physics_dt_seconds=1.0 / 120.0)
+
+    assert result["complete"] is False
+    assert result["errors"] == []
+    assert result["saturated_pairs"] == ["left-cube"]
+    pair = result["samples"][0]["pairs"][0]
+    assert pair["buffer_saturated"] is True
+    assert pair["contact_count"] == 4
+    assert len(pair["contacts"]) == 1
+
+
+def test_physx_friction_count_beyond_allocated_buffer_is_saturation() -> None:
+    sampler = _sampler(
+        max_contacts=2,
+        view=FakeContactView(friction_count=4, friction_buffer_count=1),
+    )
+
+    sampler.sample(update_index=0, physics_dt_seconds=1.0 / 120.0)
+    result = sampler.result(requested_updates=1, physics_dt_seconds=1.0 / 120.0)
+
+    assert result["complete"] is False
+    assert result["errors"] == []
+    assert result["saturated_pairs"] == ["left-cube"]
+    pair = result["samples"][0]["pairs"][0]
+    assert pair["buffer_saturated"] is True
+    assert len(pair["friction_contacts"]) == 1
 
 
 def test_contact_trace_rejects_unbounded_client_requests() -> None:
