@@ -109,6 +109,26 @@ class FakeAssetPath:
         self.resolvedPath = resolved_path
 
 
+def _install_nurec_setup(monkeypatch, setup_for_rendering) -> None:
+    rendering_setup = types.ModuleType(
+        "isaacsim.replicator.nurec_utils.rendering_setup"
+    )
+    rendering_setup.setup_for_rendering = setup_for_rendering
+    for name in (
+        "isaacsim",
+        "isaacsim.replicator",
+        "isaacsim.replicator.nurec_utils",
+    ):
+        package = types.ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setitem(
+        sys.modules,
+        "isaacsim.replicator.nurec_utils.rendering_setup",
+        rendering_setup,
+    )
+
+
 def _renderer(
     *,
     spg: bool = False,
@@ -401,13 +421,21 @@ def test_spg_requires_nurec_post_processing_to_be_disabled() -> None:
     assert any("processed twice" in error for error in report["errors"])
 
 
-def test_plain_particle_field_keeps_renderer_tonemapping_policy() -> None:
+def test_plain_particle_field_uses_nurec_setup_without_forcing_tonemapping(
+    monkeypatch,
+) -> None:
     field = _valid_particle_field()
     root = FakePrim("/World/GaussianSplat", "Xform", children=[field])
+    stage = object()
+    calls: list[Any] = []
 
-    configuration = gaussian_splats._configure_renderer_for_asset(
-        object(), object(), root
-    )
+    def setup_for_rendering(received_stage: Any):
+        calls.append(received_stage)
+        return True, True, False, []
+
+    _install_nurec_setup(monkeypatch, setup_for_rendering)
+
+    configuration = gaussian_splats._configure_renderer_for_asset(object(), stage, root)
     report = gaussian_splats._inspect_root(
         root,
         renderer=_renderer(skip_tonemapping=True),
@@ -416,9 +444,10 @@ def test_plain_particle_field_keeps_renderer_tonemapping_policy() -> None:
     assert configuration == {
         "attempted": True,
         "asset_mode": "plain_gaussian",
-        "actions": [],
+        "actions": ["applied isaacsim.replicator.nurec_utils pre-Hydra renderer setup"],
         "errors": [],
     }
+    assert calls == [stage]
     assert not any("tonemapping" in warning for warning in report["warnings"])
 
 
@@ -447,28 +476,11 @@ def test_spg_setup_uses_installed_nurec_utility(monkeypatch) -> None:
         def get_extension_manager(self) -> Extensions:
             return Extensions()
 
-    rendering_setup = types.ModuleType(
-        "isaacsim.replicator.nurec_utils.rendering_setup"
-    )
-
     def setup_for_rendering(received_stage: Any):
         calls.append(("setup", received_stage))
         return True, True, True, []
 
-    rendering_setup.setup_for_rendering = setup_for_rendering
-    for name in (
-        "isaacsim",
-        "isaacsim.replicator",
-        "isaacsim.replicator.nurec_utils",
-    ):
-        package = types.ModuleType(name)
-        package.__path__ = []
-        monkeypatch.setitem(sys.modules, name, package)
-    monkeypatch.setitem(
-        sys.modules,
-        "isaacsim.replicator.nurec_utils.rendering_setup",
-        rendering_setup,
-    )
+    _install_nurec_setup(monkeypatch, setup_for_rendering)
 
     configuration = gaussian_splats._configure_renderer_for_asset(App(), stage, root)
 
