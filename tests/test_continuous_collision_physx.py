@@ -515,7 +515,7 @@ def _install_fake_pxr(monkeypatch) -> None:
     )
 
 
-def test_collider_discovery_uses_only_enabled_direct_collision_gprims(
+def test_collider_discovery_uses_only_enabled_direct_collision_prims(
     monkeypatch,
 ) -> None:
     _install_fake_pxr(monkeypatch)
@@ -547,6 +547,53 @@ def test_collider_discovery_uses_only_enabled_direct_collision_gprims(
 
     assert probe._pairs["finger-cube"].sensor_collider_paths == (
         "/World/finger/collision",
+    )
+
+
+def test_collider_discovery_accepts_xform_shape_carriers(monkeypatch) -> None:
+    _install_fake_pxr(monkeypatch)
+    sensor = FakePrim("/World/finger", rigid_body=True)
+    carrier = sensor.add(
+        FakePrim(
+            "/World/finger/collision-carrier",
+            collision=True,
+        )
+    )
+    mesh = carrier.add(
+        FakePrim(
+            "/World/finger/collision-carrier/mesh",
+            gprim=True,
+        )
+    )
+    filtered = FakePrim("/World/cube", rigid_body=True)
+    stage = FakeStage([sensor, carrier, mesh, filtered])
+    probe = physx_module.PhysxContinuousCollisionProbe(
+        stage=stage,
+        settings=physx_module.ContinuousCollisionSettings.parse({}),
+        physx_interface=FakePhysx(
+            {
+                "/World/finger": [_transform(0.0)],
+                "/World/cube": [_transform(1.0)],
+            }
+        ),
+        scene_query_interface=FakeSceneQuery(
+            overlap=[False],
+            shape_sweep_hits=[],
+        ),
+        meters_per_unit=1.0,
+        envelope_resolver=lambda _sensor, _colliders: (0.05, 0.02, 0.02),
+        path_encoder=lambda _path: (1, 2),
+        vector_factory=lambda x, y, z: (x, y, z),
+    )
+
+    probe.prepare_pair(
+        label="finger-cube",
+        sensor_path="/World/finger",
+        filter_path="/World/cube",
+    )
+
+    assert probe._pairs["finger-cube"].sensor_collider_paths == (
+        "/World/finger/collision-carrier",
     )
 
 
