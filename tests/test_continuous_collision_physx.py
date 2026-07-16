@@ -654,8 +654,23 @@ class FakeBBox:
         return self.aligned_range
 
 
-def test_sensor_envelope_unions_relative_bounds_around_body_origin(
+@pytest.mark.parametrize(
+    ("world_rows", "expected_half_extents"),
+    [
+        (
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            (0.04, 0.03, 0.0075),
+        ),
+        (
+            ((0.0, -2.0, 0.0), (3.0, 0.0, 0.0), (0.0, 0.0, 0.5)),
+            (0.08, 0.09, 0.00375),
+        ),
+    ],
+)
+def test_sensor_envelope_unions_relative_bounds_and_applies_world_scale(
     monkeypatch,
+    world_rows,
+    expected_half_extents,
 ) -> None:
     sensor = FakePrim("/World/finger", rigid_body=True)
     first = sensor.add(FakePrim("/World/finger/first", gprim=True, collision=True))
@@ -676,8 +691,7 @@ def test_sensor_envelope_unions_relative_bounds_around_body_origin(
 
     class FakeMatrix:
         def GetRow3(self, axis):
-            rows = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-            return rows[axis]
+            return world_rows[axis]
 
     class FakeXformable:
         def __init__(self, prim) -> None:
@@ -733,10 +747,10 @@ def test_sensor_envelope_unions_relative_bounds_around_body_origin(
         [first.path, second.path],
     )
 
-    assert half_extents == pytest.approx((0.04, 0.03, 0.0075))
+    assert half_extents == pytest.approx(expected_half_extents)
 
 
-def test_sensor_envelope_rejects_scale_shear_or_reflection() -> None:
+def test_sensor_envelope_accepts_positive_orthogonal_scale_only() -> None:
     class Matrix:
         def __init__(self, rows) -> None:
             self.rows = rows
@@ -746,12 +760,33 @@ def test_sensor_envelope_rejects_scale_shear_or_reflection() -> None:
 
     rigid = Matrix(((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)))
     scaled = Matrix(((2.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+    rotated_scaled = Matrix(((0.0, -2.0, 0.0), (3.0, 0.0, 0.0), (0.0, 0.0, 0.5)))
+    sheared = Matrix(((1.0, 0.25, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
     reflected = Matrix(((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+    singular = Matrix(((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
 
-    assert physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(rigid)
-    assert not physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(
-        scaled
+    assert (
+        physx_module.PhysxContinuousCollisionProbe._positive_orthogonal_scale_components(
+            rigid
+        )
+        == pytest.approx((1.0, 1.0, 1.0))
     )
-    assert not physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(
-        reflected
+    assert (
+        physx_module.PhysxContinuousCollisionProbe._positive_orthogonal_scale_components(
+            scaled
+        )
+        == pytest.approx((2.0, 1.0, 1.0))
     )
+    assert (
+        physx_module.PhysxContinuousCollisionProbe._positive_orthogonal_scale_components(
+            rotated_scaled
+        )
+        == pytest.approx((2.0, 3.0, 0.5))
+    )
+    for invalid in (sheared, reflected, singular):
+        assert (
+            physx_module.PhysxContinuousCollisionProbe._positive_orthogonal_scale_components(
+                invalid
+            )
+            is None
+        )

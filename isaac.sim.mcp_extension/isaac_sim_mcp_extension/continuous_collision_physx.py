@@ -20,6 +20,8 @@ _DEFAULT_MAX_ROTATION_RADIANS = math.radians(5.0)
 _MAX_COLLIDERS_PER_PAIR = 32
 _MAX_HITS_PER_PAIR = 64
 _MOTION_EPSILON_M = 1.0e-12
+_MIN_LINEAR_SCALE = 1.0e-12
+_LINEAR_TRANSFORM_TOLERANCE = 1.0e-6
 _ENVELOPE_METHOD = "body_centered_symmetric_obb_with_chord_inflation"
 
 
@@ -563,10 +565,13 @@ class PhysxContinuousCollisionProbe:
         sensor_world_transform = UsdGeom.XformCache(
             Usd.TimeCode.Default()
         ).GetLocalToWorldTransform(sensor)
-        if not self._has_rigid_linear_transform(sensor_world_transform):
+        sensor_scale = self._positive_orthogonal_scale_components(
+            sensor_world_transform
+        )
+        if sensor_scale is None:
             raise ValueError(
                 "continuous collision sensor world transform contains "
-                f"scale, shear, or reflection: {sensor_path}"
+                f"shear, reflection, singular scale, or non-finite values: {sensor_path}"
             )
         purposes = [
             UsdGeom.Tokens.default_,
@@ -618,34 +623,61 @@ class PhysxContinuousCollisionProbe:
                     )
                 minimum[axis] = min(minimum[axis], lower_value)
                 maximum[axis] = max(maximum[axis], upper_value)
-        scale = float(self._meters_per_unit)
+        meters_per_unit = float(self._meters_per_unit)
+        # Relative bounds exclude the sensor transform, so restore its accepted scale.
         return tuple(
-            max(abs(minimum[axis]), abs(maximum[axis])) * scale for axis in range(3)
+            max(abs(minimum[axis]), abs(maximum[axis]))
+            * sensor_scale[axis]
+            * meters_per_unit
+            for axis in range(3)
         )
 
     @staticmethod
-    def _has_rigid_linear_transform(matrix: Any) -> bool:
+    def _positive_orthogonal_scale_components(
+        matrix: Any,
+    ) -> tuple[float, float, float] | None:
         rows = [
             tuple(float(value) for value in matrix.GetRow3(axis)) for axis in range(3)
         ]
         if not all(math.isfinite(value) for row in rows for value in row):
-            return False
-        tolerance = 1.0e-6
-        for row in rows:
-            norm = math.sqrt(sum(value * value for value in row))
-            if abs(norm - 1.0) > tolerance:
-                return False
+            return None
+        scales = tuple(math.sqrt(sum(value * value for value in row)) for row in rows)
+        if not all(
+            math.isfinite(scale) and scale > _MIN_LINEAR_SCALE for scale in scales
+        ):
+            return None
+        normalized = [
+            tuple(value / scales[index] for value in row)
+            for index, row in enumerate(rows)
+        ]
         for left in range(3):
             for right in range(left + 1, 3):
-                dot = sum(rows[left][axis] * rows[right][axis] for axis in range(3))
-                if abs(dot) > tolerance:
-                    return False
+                dot = sum(
+                    normalized[left][axis] * normalized[right][axis]
+                    for axis in range(3)
+                )
+                if abs(dot) > _LINEAR_TRANSFORM_TOLERANCE:
+                    return None
         determinant = (
-            rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
-            - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
-            + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+            normalized[0][0]
+            * (
+                normalized[1][1] * normalized[2][2]
+                - normalized[1][2] * normalized[2][1]
+            )
+            - normalized[0][1]
+            * (
+                normalized[1][0] * normalized[2][2]
+                - normalized[1][2] * normalized[2][0]
+            )
+            + normalized[0][2]
+            * (
+                normalized[1][0] * normalized[2][1]
+                - normalized[1][1] * normalized[2][0]
+            )
         )
-        return abs(determinant - 1.0) <= tolerance
+        if abs(determinant - 1.0) > _LINEAR_TRANSFORM_TOLERANCE:
+            return None
+        return scales
 
     def _resolve_sensor_colliders(self, sensor_path: str) -> Sequence[str]:
         if self._collider_resolver is not None:
