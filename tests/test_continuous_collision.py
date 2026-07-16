@@ -27,10 +27,11 @@ SPEC.loader.exec_module(continuous_collision)
 def _pose(
     x: float,
     *,
+    y: float = 0.0,
     orientation_wxyz: list[float] | None = None,
 ) -> object:
     return continuous_collision.RigidBodyPose.parse(
-        [x, 0.0, 0.0],
+        [x, y, 0.0],
         orientation_wxyz or [1.0, 0.0, 0.0, 0.0],
     )
 
@@ -49,8 +50,8 @@ def _classify(**overrides):
         "sweep_query_available": True,
         "sweep_saturated": False,
         "max_sweep_hits": 8,
-        "maximum_sensor_rotation_radians": 1.0e-6,
-        "maximum_filter_rotation_radians": 1.0e-6,
+        "maximum_sensor_rotation_radians": math.radians(5.0),
+        "maximum_filter_rotation_radians": math.radians(5.0),
     }
     values.update(overrides)
     return continuous_collision.classify_update(**values)
@@ -86,6 +87,7 @@ def test_paired_sweep_hit_without_endpoint_contact_is_tunneling() -> None:
     assert result["passed"] is False
     assert result["complete"] is True
     assert result["tunneling_detected"] is True
+    assert result["swept_collision_risk_detected"] is True
     assert result["paired_hit_count"] == 1
     assert result["failure_reasons"] == [
         "paired_body_sweep_hit_without_endpoint_contact"
@@ -114,8 +116,8 @@ def test_endpoint_contact_accounts_for_paired_sweep_hit() -> None:
     assert result["paired_hit_count"] == 1
 
 
-def test_rotation_above_translation_sweep_limit_fails_closed() -> None:
-    angle = 0.01
+def test_rotation_above_configured_limit_fails_closed() -> None:
+    angle = 0.1
     result = _classify(
         current_sensor=_pose(
             0.1,
@@ -135,9 +137,48 @@ def test_rotation_above_translation_sweep_limit_fails_closed() -> None:
     assert result["rotation_delta_radians"]["sensor"] == pytest.approx(angle)
 
 
-def test_translation_only_contract_rejects_unsafe_rotation_allowance() -> None:
-    with pytest.raises(ValueError, match="translation-only certification epsilon"):
-        _classify(maximum_sensor_rotation_radians=0.01)
+def test_rotation_safe_contract_accepts_configured_rotation_allowance() -> None:
+    angle = 0.1
+    result = _classify(
+        current_sensor=_pose(
+            0.1,
+            orientation_wxyz=[
+                math.cos(angle / 2.0),
+                0.0,
+                0.0,
+                math.sin(angle / 2.0),
+            ],
+        ),
+        maximum_sensor_rotation_radians=0.2,
+    )
+
+    assert result["classification"] == "clear"
+    assert result["rotation_delta_radians"]["relative"] == pytest.approx(angle)
+
+
+def test_common_filter_rotation_is_removed_from_relative_motion() -> None:
+    half_turn = math.pi / 4.0
+    rotation = [math.cos(half_turn), 0.0, 0.0, math.sin(half_turn)]
+    previous_sensor = _pose(1.0)
+    current_sensor = _pose(0.0, y=1.0, orientation_wxyz=rotation)
+    previous_filter = _pose(0.0)
+    current_filter = _pose(0.0, orientation_wxyz=rotation)
+
+    motion = continuous_collision.relative_motion(
+        previous_sensor,
+        current_sensor,
+        previous_filter,
+        current_filter,
+    )
+    relative_rotation = continuous_collision.relative_rotation_delta_radians(
+        previous_sensor,
+        current_sensor,
+        previous_filter,
+        current_filter,
+    )
+
+    assert motion.distance_m == pytest.approx(0.0, abs=1.0e-12)
+    assert relative_rotation == pytest.approx(0.0, abs=1.0e-12)
 
 
 @pytest.mark.parametrize(

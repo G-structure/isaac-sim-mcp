@@ -7,10 +7,10 @@ import math
 from typing import Any, Iterable, Mapping, TypedDict
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_SWEEP_HITS = 256
 _QUATERNION_NORM_TOLERANCE = 1.0e-3
-TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS = 1.0e-6
+_MOTION_EPSILON_M = 1.0e-12
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,7 @@ class SweepHitRecord(TypedDict):
 
 
 class SweepEvidence(TypedDict):
-    """Bounded result of one translation sweep query."""
+    """Bounded result of one scene-query sweep or overlap."""
 
     available: bool
     max_hits: int
@@ -117,6 +117,7 @@ class ContinuousCollisionClassification(TypedDict):
     classification: str
     passed: bool
     complete: bool
+    swept_collision_risk_detected: bool
     tunneling_detected: bool
     failure_reasons: list[str]
     errors: list[str]
@@ -141,10 +142,11 @@ __all__ = [
     "RigidBodyPose",
     "SweepEvidence",
     "SweepHitRecord",
-    "TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS",
     "bounded_sweep_hits",
     "classify_update",
     "quaternion_angular_delta_radians",
+    "rotate_vector_by_quaternion",
+    "relative_rotation_delta_radians",
     "relative_motion",
 ]
 
@@ -241,13 +243,76 @@ def quaternion_angular_delta_radians(
     return 2.0 * math.acos(min(1.0, max(0.0, absolute_dot)))
 
 
-def relative_motion(
+def _quaternion_conjugate(
+    orientation_wxyz: Iterable[Any],
+    *,
+    field: str,
+) -> tuple[float, float, float, float]:
+    w, x, y, z = _validated_quaternion(orientation_wxyz, field=field)
+    return (w, -x, -y, -z)
+
+
+def _quaternion_multiply(
+    left_wxyz: Iterable[Any],
+    right_wxyz: Iterable[Any],
+    *,
+    field: str,
+) -> tuple[float, float, float, float]:
+    left = _validated_quaternion(left_wxyz, field=f"{field}.left")
+    right = _validated_quaternion(right_wxyz, field=f"{field}.right")
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    product = (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+    normalized = _validated_quaternion(product, field=field)
+    return (normalized[0], normalized[1], normalized[2], normalized[3])
+
+
+def rotate_vector_by_quaternion(
+    orientation_wxyz: Iterable[Any],
+    vector_xyz: Iterable[Any],
+    *,
+    field: str,
+) -> tuple[float, float, float]:
+    """Rotate a vector by a scalar-first unit quaternion."""
+
+    w, x, y, z = _validated_quaternion(
+        orientation_wxyz,
+        field=f"{field}.orientation_wxyz",
+    )
+    vx, vy, vz = _finite_components(
+        vector_xyz,
+        length=3,
+        field=f"{field}.vector_xyz",
+    )
+    twice_cross = (
+        2.0 * (y * vz - z * vy),
+        2.0 * (z * vx - x * vz),
+        2.0 * (x * vy - y * vx),
+    )
+    cross_again = (
+        y * twice_cross[2] - z * twice_cross[1],
+        z * twice_cross[0] - x * twice_cross[2],
+        x * twice_cross[1] - y * twice_cross[0],
+    )
+    return (
+        vx + w * twice_cross[0] + cross_again[0],
+        vy + w * twice_cross[1] + cross_again[1],
+        vz + w * twice_cross[2] + cross_again[2],
+    )
+
+
+def relative_rotation_delta_radians(
     previous_sensor: PoseInput,
     current_sensor: PoseInput,
     previous_filter: PoseInput,
     current_filter: PoseInput,
-) -> RelativeMotion:
-    """Return sensor translation in a frame where the paired body is fixed."""
+) -> float:
+    """Return sensor rotation relative to a frame rigidly attached to the filter."""
 
     previous_sensor_pose = RigidBodyPose.parse(
         previous_sensor,
@@ -265,17 +330,84 @@ def relative_motion(
         current_filter,
         field="current_filter",
     )
+    previous_relative = _quaternion_multiply(
+        _quaternion_conjugate(
+            previous_filter_pose.orientation_wxyz,
+            field="previous_filter.orientation_wxyz",
+        ),
+        previous_sensor_pose.orientation_wxyz,
+        field="previous_relative_orientation",
+    )
+    current_relative = _quaternion_multiply(
+        _quaternion_conjugate(
+            current_filter_pose.orientation_wxyz,
+            field="current_filter.orientation_wxyz",
+        ),
+        current_sensor_pose.orientation_wxyz,
+        field="current_relative_orientation",
+    )
+    return quaternion_angular_delta_radians(previous_relative, current_relative)
+
+
+def relative_motion(
+    previous_sensor: PoseInput,
+    current_sensor: PoseInput,
+    previous_filter: PoseInput,
+    current_filter: PoseInput,
+) -> RelativeMotion:
+    """Return sensor translation in coordinates rigidly attached to the filter."""
+
+    previous_sensor_pose = RigidBodyPose.parse(
+        previous_sensor,
+        field="previous_sensor",
+    )
+    current_sensor_pose = RigidBodyPose.parse(
+        current_sensor,
+        field="current_sensor",
+    )
+    previous_filter_pose = RigidBodyPose.parse(
+        previous_filter,
+        field="previous_filter",
+    )
+    current_filter_pose = RigidBodyPose.parse(
+        current_filter,
+        field="current_filter",
+    )
+    previous_sensor_from_filter = tuple(
+        previous_sensor_pose.position_m[axis] - previous_filter_pose.position_m[axis]
+        for axis in range(3)
+    )
+    previous_sensor_in_filter = rotate_vector_by_quaternion(
+        _quaternion_conjugate(
+            previous_filter_pose.orientation_wxyz,
+            field="previous_filter.orientation_wxyz",
+        ),
+        previous_sensor_from_filter,
+        field="previous_sensor_in_filter",
+    )
+    current_sensor_from_filter = tuple(
+        current_sensor_pose.position_m[axis] - current_filter_pose.position_m[axis]
+        for axis in range(3)
+    )
+    current_sensor_in_filter = rotate_vector_by_quaternion(
+        _quaternion_conjugate(
+            current_filter_pose.orientation_wxyz,
+            field="current_filter.orientation_wxyz",
+        ),
+        current_sensor_from_filter,
+        field="current_sensor_in_filter",
+    )
     translation = tuple(
-        (current_sensor_pose.position_m[axis] - previous_sensor_pose.position_m[axis])
-        - (current_filter_pose.position_m[axis] - previous_filter_pose.position_m[axis])
+        current_sensor_in_filter[axis] - previous_sensor_in_filter[axis]
         for axis in range(3)
     )
     distance = math.sqrt(sum(component * component for component in translation))
-    direction = (
-        tuple(component / distance for component in translation)
-        if distance > 0.0
-        else (0.0, 0.0, 0.0)
-    )
+    if distance <= _MOTION_EPSILON_M:
+        translation = (0.0, 0.0, 0.0)
+        direction = (0.0, 0.0, 0.0)
+        distance = 0.0
+    else:
+        direction = tuple(component / distance for component in translation)
     return RelativeMotion(
         (translation[0], translation[1], translation[2]),
         (direction[0], direction[1], direction[2]),
@@ -363,7 +495,7 @@ def classify_update(
     max_sweep_hits: int = 64,
     sweep_saturated: bool = False,
 ) -> ContinuousCollisionClassification:
-    """Classify one update, treating incomplete translation-sweep evidence as failure."""
+    """Classify one update, treating incomplete swept-volume evidence as failure."""
 
     sensor = _absolute_path(sensor_path, field="sensor_path")
     filtered = _absolute_path(filter_path, field="filter_path")
@@ -382,16 +514,6 @@ def classify_update(
         raise ValueError("maximum_sensor_rotation_radians must not exceed pi")
     if filter_rotation_limit > math.pi:
         raise ValueError("maximum_filter_rotation_radians must not exceed pi")
-    if sensor_rotation_limit > TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
-        raise ValueError(
-            "maximum_sensor_rotation_radians must not exceed the "
-            "translation-only certification epsilon"
-        )
-    if filter_rotation_limit > TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
-        raise ValueError(
-            "maximum_filter_rotation_radians must not exceed the "
-            "translation-only certification epsilon"
-        )
 
     failure_reasons: list[str] = []
     errors: list[str] = []
@@ -481,10 +603,17 @@ def classify_update(
             previous_filter_pose.orientation_wxyz,
             current_filter_pose.orientation_wxyz,
         )
+        relative_rotation = relative_rotation_delta_radians(
+            previous_sensor_pose,
+            current_sensor_pose,
+            previous_filter_pose,
+            current_filter_pose,
+        )
         rotation_deltas = {
             "sensor": sensor_rotation,
             "filter": filter_rotation,
-            "maximum": max(sensor_rotation, filter_rotation),
+            "relative": relative_rotation,
+            "maximum": max(sensor_rotation, filter_rotation, relative_rotation),
         }
         if sensor_rotation > sensor_rotation_limit:
             fail("sensor_rotation_limit_exceeded")
@@ -522,6 +651,7 @@ def classify_update(
         "classification": classification,
         "passed": passed,
         "complete": complete,
+        "swept_collision_risk_detected": tunneling_detected,
         "tunneling_detected": tunneling_detected,
         "failure_reasons": failure_reasons,
         "errors": errors,

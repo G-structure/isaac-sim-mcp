@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import math
 from pathlib import Path
 import sys
 import types
@@ -37,11 +38,16 @@ _load_module("continuous_collision")
 physx_module = _load_module("continuous_collision_physx")
 
 
-def _transform(x: float) -> dict[str, object]:
+def _transform(
+    x: float,
+    *,
+    y: float = 0.0,
+    rotation_xyzw: list[float] | None = None,
+) -> dict[str, object]:
     return {
         "ret_val": True,
-        "position": [x, 0.0, 0.0],
-        "rotation": [0.0, 0.0, 0.0, 1.0],
+        "position": [x, y, 0.0],
+        "rotation": rotation_xyzw or [0.0, 0.0, 0.0, 1.0],
     }
 
 
@@ -61,10 +67,21 @@ class FakeHit:
 
 
 class FakeSceneQuery:
-    def __init__(self, *, overlap: list[bool], sweep_hits: list[FakeHit]) -> None:
+    def __init__(
+        self,
+        *,
+        overlap: list[bool],
+        shape_sweep_hits: list[FakeHit],
+        box_sweep_hits: list[FakeHit] | None = None,
+        box_overlap_hits: list[FakeHit] | None = None,
+    ) -> None:
         self.overlap = overlap
-        self.sweep_hits = sweep_hits
-        self.sweeps: list[tuple[object, float]] = []
+        self.shape_sweep_hits = shape_sweep_hits
+        self.box_sweep_hits = list(box_sweep_hits or [])
+        self.box_overlap_hits = list(box_overlap_hits or [])
+        self.shape_sweeps: list[tuple[object, float]] = []
+        self.box_sweeps: list[tuple[object, object, object, object, float]] = []
+        self.box_overlaps: list[tuple[object, object, object]] = []
 
     def overlap_shape(self, _a, _b, report, _both_sides) -> int:
         paired = self.overlap.pop(0)
@@ -73,11 +90,41 @@ class FakeSceneQuery:
         return int(paired)
 
     def sweep_shape_all(self, _a, _b, direction, distance, report, _both_sides):
-        self.sweeps.append((direction, distance))
-        for hit in self.sweep_hits:
+        self.shape_sweeps.append((direction, distance))
+        for hit in self.shape_sweep_hits:
             if report(hit) is False:
                 break
-        return bool(self.sweep_hits)
+        return bool(self.shape_sweep_hits)
+
+    def sweep_box_all(
+        self,
+        half_extents,
+        position,
+        rotation,
+        direction,
+        distance,
+        report,
+        _both_sides,
+    ):
+        self.box_sweeps.append((half_extents, position, rotation, direction, distance))
+        for hit in self.box_sweep_hits:
+            if report(hit) is False:
+                break
+        return bool(self.box_sweep_hits)
+
+    def overlap_box(
+        self,
+        half_extents,
+        position,
+        rotation,
+        report,
+        _any_hit,
+    ):
+        self.box_overlaps.append((half_extents, position, rotation))
+        for hit in self.box_overlap_hits:
+            if report(hit) is False:
+                break
+        return bool(self.box_overlap_hits)
 
 
 def _probe(
@@ -86,11 +133,17 @@ def _probe(
     filter_positions: tuple[float, float] = (0.15, 0.15),
     overlap: list[bool] | None = None,
     sweep_hits: list[FakeHit] | None = None,
+    box_overlap_hits: list[FakeHit] | None = None,
+    sensor_transforms: list[dict[str, object]] | None = None,
+    filter_transforms: list[dict[str, object]] | None = None,
     max_hits_per_pair: int = 16,
 ):
+    shared_sweep_hits = list(sweep_hits or [])
     query = FakeSceneQuery(
         overlap=list(overlap or [False, False]),
-        sweep_hits=list(sweep_hits or []),
+        shape_sweep_hits=list(shared_sweep_hits),
+        box_sweep_hits=list(shared_sweep_hits),
+        box_overlap_hits=box_overlap_hits,
     )
     probe = physx_module.PhysxContinuousCollisionProbe(
         stage=None,
@@ -100,12 +153,22 @@ def _probe(
         physx_interface=FakePhysx(
             {
                 "/World/finger": [
-                    _transform(sensor_positions[0]),
-                    _transform(sensor_positions[1]),
+                    *(
+                        sensor_transforms
+                        or [
+                            _transform(sensor_positions[0]),
+                            _transform(sensor_positions[1]),
+                        ]
+                    ),
                 ],
                 "/World/cube": [
-                    _transform(filter_positions[0]),
-                    _transform(filter_positions[1]),
+                    *(
+                        filter_transforms
+                        or [
+                            _transform(filter_positions[0]),
+                            _transform(filter_positions[1]),
+                        ]
+                    ),
                 ],
             }
         ),
@@ -113,8 +176,10 @@ def _probe(
         meters_per_unit=1.0,
         collider_resolver=lambda _path: ["/World/finger/collision"],
         collider_validator=lambda _sensor, _colliders: None,
+        envelope_resolver=lambda _sensor, _colliders: (0.05, 0.02, 0.02),
         path_encoder=lambda _path: (1, 2),
         vector_factory=lambda x, y, z: (x, y, z),
+        quaternion_factory=lambda x, y, z, w: (x, y, z, w),
     )
     probe.prepare_pair(
         label="finger-cube",
@@ -137,8 +202,17 @@ def test_backward_relative_sweep_detects_endpoint_clean_crossing() -> None:
     assert result["classification"] == "paired_tunneling"
     assert result["tunneling_detected"] is True
     assert result["complete"] is True
-    assert query.sweeps == [((-1.0, -0.0, -0.0), pytest.approx(0.3))]
+    assert query.box_sweeps[0][3:] == (
+        (-1.0, -0.0, -0.0),
+        pytest.approx(0.3),
+    )
+    assert query.shape_sweeps == [((-1.0, -0.0, -0.0), pytest.approx(0.3))]
     assert result["relative_motion"]["distance_m"] == pytest.approx(0.3)
+    assert result["schema_version"] == 2
+    assert result["sweep_semantics"] == (
+        "rotation_safe_sensor_body_obb_backward_in_current_filter_frame"
+    )
+    assert result["translation_shape_sweep"]["captured_hit_count"] == 1
 
 
 def test_current_manifold_contact_accounts_for_sweep_hit() -> None:
@@ -165,7 +239,37 @@ def test_filter_motion_is_removed_from_relative_translation() -> None:
     )
 
     assert result["relative_motion"]["distance_m"] == pytest.approx(0.2)
-    assert query.sweeps[0][1] == pytest.approx(0.2)
+    assert query.box_sweeps[0][4] == pytest.approx(0.2)
+
+
+def test_filter_corotation_is_removed_before_scene_query() -> None:
+    quarter_turn = [0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)]
+    probe, query = _probe(
+        sensor_transforms=[
+            _transform(1.0),
+            _transform(0.0, y=1.0, rotation_xyzw=quarter_turn),
+        ],
+        filter_transforms=[
+            _transform(0.0),
+            _transform(0.0, rotation_xyzw=quarter_turn),
+        ],
+    )
+
+    result = probe.sample_pair(
+        label="finger-cube",
+        current_manifold_contact=False,
+    )
+
+    assert result["relative_motion"]["distance_m"] == pytest.approx(
+        0.0,
+        abs=1.0e-12,
+    )
+    assert result["rotation_delta_radians"]["relative"] == pytest.approx(
+        0.0,
+        abs=1.0e-12,
+    )
+    assert query.box_sweeps == []
+    assert len(query.box_overlaps) == 1
 
 
 def test_missing_endpoint_query_fails_closed() -> None:
@@ -183,6 +287,21 @@ def test_missing_endpoint_query_fails_closed() -> None:
     assert result["complete"] is False
     assert "endpoint_contact_evidence_unavailable" in result["failure_reasons"]
     assert any("scene query unavailable" in error for error in result["errors"])
+
+
+def test_unknown_manifold_and_clean_overlap_remain_indeterminate() -> None:
+    probe, _ = _probe(overlap=[False, False])
+
+    result = probe.sample_pair(
+        label="finger-cube",
+        current_manifold_contact=None,
+    )
+
+    assert result["current_endpoint_contact"] is None
+    assert result["endpoint_evidence"]["current_manifold_contact"] is None
+    assert result["classification"] == "indeterminate"
+    assert result["complete"] is False
+    assert "endpoint_contact_evidence_unavailable" in result["failure_reasons"]
 
 
 def test_sweep_collects_until_the_bounded_buffer_saturates() -> None:
@@ -203,6 +322,65 @@ def test_sweep_collects_until_the_bounded_buffer_saturates() -> None:
     assert result["sweep"]["saturated"] is True
     assert result["sweep"]["captured_hit_count"] == 1
     assert "sweep_hits_saturated" in result["failure_reasons"]
+
+
+def test_rotation_only_motion_uses_inflated_overlap_envelope() -> None:
+    angle = 0.05
+    rotation_xyzw = [0.0, 0.0, math.sin(angle / 2.0), math.cos(angle / 2.0)]
+    probe, query = _probe(
+        sensor_transforms=[
+            _transform(0.0),
+            _transform(0.0, rotation_xyzw=rotation_xyzw),
+        ],
+        box_overlap_hits=[FakeHit("/World/cube", "/World/cube/collision", 0.0)],
+    )
+
+    result = probe.sample_pair(
+        label="finger-cube",
+        current_manifold_contact=False,
+    )
+
+    radius = math.sqrt(0.05**2 + 0.02**2 + 0.02**2)
+    expected_inflation = 2.0 * radius * math.sin(angle / 2.0)
+    assert result["classification"] == "paired_tunneling"
+    assert result["rotation_envelope"] == {
+        "method": "body_centered_symmetric_obb_with_chord_inflation",
+        "base_half_extents_m": pytest.approx([0.05, 0.02, 0.02]),
+        "radius_m": pytest.approx(radius),
+        "relative_rotation_rad": pytest.approx(angle),
+        "inflation_m": pytest.approx(expected_inflation),
+        "query_half_extents_m": pytest.approx(
+            [
+                0.05 + expected_inflation,
+                0.02 + expected_inflation,
+                0.02 + expected_inflation,
+            ]
+        ),
+        "query_kind": "overlap_box",
+    }
+    assert len(query.box_overlaps) == 1
+    assert query.shape_sweeps == []
+
+
+def test_rotation_only_motion_without_envelope_hit_is_clear() -> None:
+    angle = 0.05
+    rotation_xyzw = [0.0, 0.0, math.sin(angle / 2.0), math.cos(angle / 2.0)]
+    probe, query = _probe(
+        sensor_transforms=[
+            _transform(0.0),
+            _transform(0.0, rotation_xyzw=rotation_xyzw),
+        ],
+    )
+
+    result = probe.sample_pair(
+        label="finger-cube",
+        current_manifold_contact=False,
+    )
+
+    assert result["classification"] == "clear"
+    assert result["complete"] is True
+    assert result["rotation_delta_radians"]["relative"] == pytest.approx(angle)
+    assert len(query.box_overlaps) == 1
 
 
 class FakeGprim:
@@ -351,8 +529,12 @@ def test_collider_discovery_uses_only_enabled_direct_collision_gprims(
                 "/World/cube": [_transform(1.0)],
             }
         ),
-        scene_query_interface=FakeSceneQuery(overlap=[False], sweep_hits=[]),
+        scene_query_interface=FakeSceneQuery(
+            overlap=[False],
+            shape_sweep_hits=[],
+        ),
         meters_per_unit=1.0,
+        envelope_resolver=lambda _sensor, _colliders: (0.05, 0.02, 0.02),
         path_encoder=lambda _path: (1, 2),
         vector_factory=lambda x, y, z: (x, y, z),
     )
@@ -386,7 +568,10 @@ def test_explicit_collider_overrides_reject_nonphysical_geometry(
         stage=stage,
         settings=physx_module.ContinuousCollisionSettings.parse({}),
         physx_interface=FakePhysx({}),
-        scene_query_interface=FakeSceneQuery(overlap=[], sweep_hits=[]),
+        scene_query_interface=FakeSceneQuery(
+            overlap=[],
+            shape_sweep_hits=[],
+        ),
         meters_per_unit=1.0,
     )
 
@@ -397,3 +582,129 @@ def test_explicit_collider_overrides_reject_nonphysical_geometry(
             filter_path="/World/cube",
             sensor_collider_paths=[collider_path],
         )
+
+
+class FakeAlignedRange:
+    def __init__(self, lower, upper) -> None:
+        self.lower = lower
+        self.upper = upper
+
+    def GetMin(self):
+        return self.lower
+
+    def GetMax(self):
+        return self.upper
+
+    def IsEmpty(self) -> bool:
+        return False
+
+
+class FakeBBox:
+    def __init__(self, lower, upper) -> None:
+        self.aligned_range = FakeAlignedRange(lower, upper)
+
+    def ComputeAlignedRange(self):
+        return self.aligned_range
+
+
+def test_sensor_envelope_unions_relative_bounds_around_body_origin(
+    monkeypatch,
+) -> None:
+    sensor = FakePrim("/World/finger", rigid_body=True)
+    first = sensor.add(FakePrim("/World/finger/first", gprim=True, collision=True))
+    second = sensor.add(FakePrim("/World/finger/second", gprim=True, collision=True))
+    stage = FakeStage([sensor, first, second])
+    bounds = {
+        first.path: ([-2.0, -1.0, -0.5], [1.0, 2.0, 0.5]),
+        second.path: ([-1.0, -3.0, -0.25], [4.0, 1.0, 0.75]),
+    }
+
+    class FakeBBoxCache:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def ComputeRelativeBound(self, collider, relative_to):
+            assert relative_to is sensor
+            return FakeBBox(*bounds[collider.path])
+
+    class FakeMatrix:
+        def GetRow3(self, axis):
+            rows = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+            return rows[axis]
+
+    class FakeXformable:
+        def __init__(self, prim) -> None:
+            self.prim = prim
+
+        def GetLocalTransformation(self):
+            return FakeMatrix()
+
+        def TransformMightBeTimeVarying(self) -> bool:
+            return False
+
+    class FakeXformCache:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def GetLocalToWorldTransform(self, prim):
+            assert prim is sensor
+            return FakeMatrix()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pxr",
+        types.SimpleNamespace(
+            Usd=types.SimpleNamespace(
+                TimeCode=types.SimpleNamespace(Default=lambda: object())
+            ),
+            UsdGeom=types.SimpleNamespace(
+                BBoxCache=FakeBBoxCache,
+                XformCache=FakeXformCache,
+                Xformable=FakeXformable,
+                Tokens=types.SimpleNamespace(
+                    default_="default",
+                    render="render",
+                    proxy="proxy",
+                    guide="guide",
+                ),
+            ),
+        ),
+    )
+    probe = physx_module.PhysxContinuousCollisionProbe(
+        stage=stage,
+        settings=physx_module.ContinuousCollisionSettings.parse({}),
+        physx_interface=FakePhysx({}),
+        scene_query_interface=FakeSceneQuery(
+            overlap=[],
+            shape_sweep_hits=[],
+        ),
+        meters_per_unit=0.01,
+    )
+
+    half_extents = probe._resolve_sensor_half_extents_m(
+        sensor.path,
+        [first.path, second.path],
+    )
+
+    assert half_extents == pytest.approx((0.04, 0.03, 0.0075))
+
+
+def test_sensor_envelope_rejects_scale_shear_or_reflection() -> None:
+    class Matrix:
+        def __init__(self, rows) -> None:
+            self.rows = rows
+
+        def GetRow3(self, axis):
+            return self.rows[axis]
+
+    rigid = Matrix(((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)))
+    scaled = Matrix(((2.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+    reflected = Matrix(((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+
+    assert physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(rigid)
+    assert not physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(
+        scaled
+    )
+    assert not physx_module.PhysxContinuousCollisionProbe._has_rigid_linear_transform(
+        reflected
+    )

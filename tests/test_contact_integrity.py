@@ -105,13 +105,34 @@ class FakeContinuousProbe:
         self.evidence = evidence
         self.closed = False
 
-    def sample_pair(self, *, label: str, current_manifold_contact: bool):
+    def sample_pair(self, *, label: str, current_manifold_contact: bool | None):
         assert label == "left-cube"
         assert current_manifold_contact is True
         return dict(self.evidence)
 
     def close(self) -> None:
         self.closed = True
+
+
+class RecordingContinuousProbe:
+    def __init__(self) -> None:
+        self.manifold_contacts: list[bool | None] = []
+
+    def sample_pair(self, *, label: str, current_manifold_contact: bool | None):
+        assert label == "left-cube"
+        self.manifold_contacts.append(current_manifold_contact)
+        return {
+            "schema_version": 2,
+            "complete": False,
+            "passed": False,
+            "swept_collision_risk_detected": False,
+            "tunneling_detected": False,
+            "failure_reasons": ["endpoint_contact_evidence_unavailable"],
+            "errors": [],
+        }
+
+    def close(self) -> None:
+        pass
 
 
 def test_contact_trace_preserves_penetration_impulse_and_friction() -> None:
@@ -195,6 +216,16 @@ def test_full_contact_buffer_invalidates_trace() -> None:
     assert result["complete"] is False
     assert result["saturated_pairs"] == ["left-cube"]
     assert result["samples"][0]["pairs"][0]["buffer_saturated"] is True
+
+
+def test_unreadable_manifold_is_not_coerced_to_contact_absence() -> None:
+    sampler = _sampler(max_contacts=1, continuous_collision={})
+    probe = RecordingContinuousProbe()
+    sampler._continuous_probe = probe
+
+    sampler.sample(update_index=0, physics_dt_seconds=1.0 / 120.0)
+
+    assert probe.manifold_contacts == [None]
 
 
 def test_physx_count_beyond_allocated_buffer_is_saturation() -> None:
@@ -301,12 +332,19 @@ def test_continuous_collision_crossing_is_a_machine_readable_violation() -> None
         {
             "complete": True,
             "passed": False,
+            "swept_collision_risk_detected": True,
             "tunneling_detected": True,
             "paired_hit_count": 1,
             "failure_reasons": ["paired_body_sweep_hit_without_endpoint_contact"],
             "errors": [],
             "relative_motion": {"distance_m": 0.25},
-            "rotation_delta_radians": {"sensor": 0.01, "filter": 0.02},
+            "rotation_delta_radians": {
+                "sensor": 0.01,
+                "filter": 0.02,
+                "relative": 0.03,
+                "maximum": 0.02,
+            },
+            "rotation_envelope": {"inflation_m": 0.004},
         }
     )
 
@@ -317,6 +355,10 @@ def test_continuous_collision_crossing_is_a_machine_readable_violation() -> None
     assert result["within_configured_limits"] is False
     assert result["summary"]["unreported_swept_collisions"] == 1
     assert result["summary"]["maximum_relative_translation_m"] == pytest.approx(0.25)
+    assert result["summary"]["maximum_relative_rotation_rad"] == pytest.approx(0.03)
+    assert result["summary"]["maximum_rotation_envelope_inflation_m"] == pytest.approx(
+        0.004
+    )
     assert result["violations"][-1] == {
         "update_index": 3,
         "pair_label": "left-cube",
@@ -353,13 +395,24 @@ def test_continuous_collision_configuration_is_bounded_and_strict() -> None:
         contact_integrity.ContactIntegrityConfig.parse(
             {**base, "continuous_collision": {"max_hitz": 4}}
         )
-    with pytest.raises(ValueError, match="translation-only certification epsilon"):
+    with pytest.raises(ValueError, match="between 0 and pi"):
         contact_integrity.ContactIntegrityConfig.parse(
             {
                 **base,
-                "continuous_collision": {"maximum_sensor_rotation_rad": 0.01},
+                "continuous_collision": {
+                    "maximum_sensor_rotation_rad": 4.0,
+                },
             }
         )
+
+    parsed = contact_integrity.ContactIntegrityConfig.parse(
+        {
+            **base,
+            "continuous_collision": {"maximum_sensor_rotation_rad": 0.01},
+        }
+    )
+    assert parsed.continuous_collision is not None
+    assert parsed.continuous_collision["maximum_sensor_rotation_rad"] == 0.01
 
     sampler = contact_integrity.ContactIntegritySampler(
         None,
@@ -369,4 +422,5 @@ def test_continuous_collision_configuration_is_bounded_and_strict() -> None:
         },
     )
     with pytest.raises(ValueError, match="bounded response budget"):
-        sampler.validate_request_size(129)
+        sampler.validate_request_size(43)
+    sampler.validate_request_size(42)

@@ -179,8 +179,8 @@ The Isaac Sim MCP Extension provides several specialized tools that can be acces
       "maximum_normal_impulse_ns": 0.5
     },
     "continuous_collision": {
-      "maximum_sensor_rotation_rad": 0.000001,
-      "maximum_filter_rotation_rad": 0.000001,
+      "maximum_sensor_rotation_rad": 0.0872664626,
+      "maximum_filter_rotation_rad": 0.0872664626,
       "max_hits_per_pair": 16
     },
     "pairs": [
@@ -205,26 +205,42 @@ trace preserves the readable bounded prefix and names the pair in
 `saturated_pairs`; callers must still reject the incomplete trace. When
 `limits` are present, `within_configured_limits` and `violations` provide a
 machine-readable physics-quality verdict without relying on rendered frames.
-The product of updates, pairs, and per-pair capacity may not exceed 8192 contact
-slots, so an untrusted caller cannot request an unbounded in-memory trace.
+Contact points and both continuous-collision hit buffers share one combined
+8192-record budget, so an untrusted caller cannot request an unbounded in-memory
+trace. An unreadable or saturated contact window is preserved as unknown
+manifold evidence; it is never converted into definitive contact absence.
 
 When `continuous_collision` is present, the extension also copies exact PhysX
 rigid-body poses before the first update and after every requested update. For
-each pair it discovers the sensor body's collision GPrims, checks both endpoint
-overlaps, and sweeps each current sensor shape backward through the sensor's
-translation relative to the filter body. A paired-body sweep hit with neither
-endpoint in contact or overlap is reported as
-`unreported_swept_collision`, covering the case where a fast finger crosses an
-object between sampled contact manifolds. The translation sweep records both
-body poses, relative motion, hit distance, collider path, and separate sensor
-and filter rotation deltas. Evidence fails closed when transforms or scene
-queries are unavailable, a sweep buffer saturates, or either body rotates beyond
-the one-microradian numerical epsilon. Rotation is never certified by a
-translation-only query. Automatic discovery and optional
+each pair it discovers the sensor body's enabled collision GPrims, checks both
+endpoint overlaps, and constructs a body-centered symmetric OBB that encloses
+all selected collision geometry. The OBB is inflated by
+`2 * radius * sin(relative_rotation / 2)`, which conservatively covers the
+maximum point displacement along the bounded rotational update, then swept
+backward through the sensor's translation in the current filter-body frame. A
+paired-body envelope hit with neither endpoint in contact or overlap is reported
+as `unreported_swept_collision`. This is intentionally fail-closed: it identifies
+a conservative swept-collision risk rather than claiming an exact time of
+impact. Schema v2 names that verdict `swept_collision_risk_detected` and retains
+`tunneling_detected` as an equal compatibility alias.
+
+The schema-v2 record includes both body poses, current-filter-frame relative
+motion, absolute and relative rotation deltas, the base/query OBB extents, chord
+inflation, hit distance, and collider path. It also keeps a separate
+`translation_shape_sweep` using the exact current collision shapes as diagnostic
+evidence; that translation-only query is never used to certify rotation. Evidence
+fails closed when transforms or safety queries are unavailable, a safety buffer
+saturates, or either body exceeds the configured per-update rotation bound. The
+default bound is five degrees, which supports ordinary articulated motion while
+still bounding the conservative interpolation. Automatic discovery and optional
 `sensor_collider_paths` overrides accept only enabled GPrims with a directly
 applied CollisionAPI whose closest rigid-body ancestor is the declared sensor;
-visual, disabled, and nested-body geometry is rejected. The total response
-remains bounded by the same 8192-slot budget.
+visual, disabled, and nested-body geometry is rejected. Both bounded sweep
+buffers and contact points count against the combined 8192-record response
+budget. Envelope preparation also rejects time-varying descendant transforms
+and rigid-body transforms with world-space scale, shear, or reflection, because
+the runtime PhysX pose contract exposes only position and quaternion and cannot
+safely reconstruct those frames.
 
 `get_physics_state` now reads rigid-body velocity from an exact PhysX tensor
 view. It reports `velocity_complete=false` rather than substituting zero when a

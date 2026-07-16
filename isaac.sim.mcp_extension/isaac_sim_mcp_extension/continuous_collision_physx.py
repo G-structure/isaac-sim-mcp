@@ -7,21 +7,25 @@ import math
 from typing import Any, Callable, Mapping, Sequence
 
 from .continuous_collision import (
-    TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS,
     RigidBodyPose,
+    bounded_sweep_hits,
     classify_update,
     relative_motion,
+    relative_rotation_delta_radians,
+    rotate_vector_by_quaternion,
 )
 
 
-_DEFAULT_MAX_ROTATION_RADIANS = TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS
+_DEFAULT_MAX_ROTATION_RADIANS = math.radians(5.0)
 _MAX_COLLIDERS_PER_PAIR = 32
 _MAX_HITS_PER_PAIR = 64
+_MOTION_EPSILON_M = 1.0e-12
+_ENVELOPE_METHOD = "body_centered_symmetric_obb_with_chord_inflation"
 
 
 @dataclass(frozen=True)
 class ContinuousCollisionSettings:
-    """Validated policy for translation-sweep evidence."""
+    """Validated policy for conservative swept-volume evidence."""
 
     maximum_sensor_rotation_rad: float
     maximum_filter_rotation_rad: float
@@ -51,11 +55,6 @@ class ContinuousCollisionSettings:
             if not math.isfinite(result) or not 0 <= result <= math.pi:
                 raise ValueError(
                     f"continuous_collision.{name} must be finite and between 0 and pi"
-                )
-            if result > TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
-                raise ValueError(
-                    f"continuous_collision.{name} must not exceed the "
-                    "translation-only certification epsilon"
                 )
             return result
 
@@ -89,6 +88,7 @@ class _PairState:
     sensor_path: str
     filter_path: str
     sensor_collider_paths: tuple[str, ...]
+    sensor_half_extents_m: tuple[float, float, float]
     previous_sensor_pose: RigidBodyPose | None
     previous_filter_pose: RigidBodyPose | None
     previous_endpoint_contact: bool | None
@@ -96,7 +96,7 @@ class _PairState:
 
 
 class PhysxContinuousCollisionProbe:
-    """Own exact poses, endpoint overlaps, and shape sweeps for one trace."""
+    """Own endpoint, exact-shape, and rotation-safe envelope evidence."""
 
     def __init__(
         self,
@@ -108,8 +108,11 @@ class PhysxContinuousCollisionProbe:
         meters_per_unit: float | None = None,
         collider_resolver: Callable[[str], Sequence[str]] | None = None,
         collider_validator: Callable[[str, Sequence[str]], None] | None = None,
+        envelope_resolver: Callable[[str, Sequence[str]], Sequence[float]]
+        | None = None,
         path_encoder: Callable[[str], tuple[int, int]] | None = None,
         vector_factory: Callable[[float, float, float], Any] | None = None,
+        quaternion_factory: Callable[[float, float, float, float], Any] | None = None,
     ) -> None:
         self._stage = stage
         self.settings = settings
@@ -118,8 +121,10 @@ class PhysxContinuousCollisionProbe:
         self._meters_per_unit = meters_per_unit
         self._collider_resolver = collider_resolver
         self._collider_validator = collider_validator
+        self._envelope_resolver = envelope_resolver
         self._path_encoder = path_encoder
         self._vector_factory = vector_factory
+        self._quaternion_factory = quaternion_factory
         self._pairs: dict[str, _PairState] = {}
 
     def prepare_pair(
@@ -149,6 +154,7 @@ class PhysxContinuousCollisionProbe:
             self._collider_validator(sensor_path, colliders)
         else:
             self._validate_sensor_colliders(sensor_path, colliders)
+        half_extents = self._sensor_half_extents_m(sensor_path, colliders)
 
         errors: list[str] = []
         previous_sensor = self._try_pose(sensor_path, errors)
@@ -159,6 +165,7 @@ class PhysxContinuousCollisionProbe:
             sensor_path=sensor_path,
             filter_path=filter_path,
             sensor_collider_paths=colliders,
+            sensor_half_extents_m=half_extents,
             previous_sensor_pose=previous_sensor,
             previous_filter_pose=previous_filter,
             previous_endpoint_contact=previous_overlap,
@@ -169,13 +176,16 @@ class PhysxContinuousCollisionProbe:
         self,
         *,
         label: str,
-        current_manifold_contact: bool,
+        current_manifold_contact: bool | None,
     ) -> dict[str, Any]:
         state = self._pairs.get(label)
         if state is None:
             raise RuntimeError(f"continuous collision pair was not prepared: {label}")
-        if not isinstance(current_manifold_contact, bool):
-            raise ValueError("current_manifold_contact must be a boolean")
+        if current_manifold_contact is not None and not isinstance(
+            current_manifold_contact,
+            bool,
+        ):
+            raise ValueError("current_manifold_contact must be a boolean or null")
 
         errors = list(state.previous_errors)
         current_sensor = self._try_pose(state.sensor_path, errors)
@@ -189,13 +199,18 @@ class PhysxContinuousCollisionProbe:
             True
             if current_manifold_contact or current_overlap is True
             else False
-            if current_overlap is False
+            if current_manifold_contact is False and current_overlap is False
             else None
         )
 
-        sweep_hits: list[dict[str, Any]] | None = None
-        sweep_available = False
-        sweep_saturated = False
+        envelope_hits: list[dict[str, Any]] | None = None
+        envelope_available = False
+        envelope_saturated = False
+        envelope_metadata: dict[str, Any] | None = None
+        shape_hits: list[dict[str, Any]] | None = None
+        shape_available = False
+        shape_saturated = False
+        diagnostic_errors: list[str] = []
         if all(
             pose is not None
             for pose in (
@@ -215,15 +230,39 @@ class PhysxContinuousCollisionProbe:
                 state.previous_filter_pose,
                 current_filter,
             )
+            relative_rotation = relative_rotation_delta_radians(
+                state.previous_sensor_pose,
+                current_sensor,
+                state.previous_filter_pose,
+                current_filter,
+            )
+            world_direction = rotate_vector_by_quaternion(
+                current_filter.orientation_wxyz,
+                motion.direction_unit,
+                field="relative_motion_world_direction",
+            )
             try:
-                sweep_hits, sweep_saturated = self._sweep_pair(
+                envelope_hits, envelope_saturated, envelope_metadata = (
+                    self._query_rotation_envelope(
+                        state,
+                        current_sensor=current_sensor,
+                        direction_unit=tuple(-value for value in world_direction),
+                        distance_m=motion.distance_m,
+                        relative_rotation_rad=relative_rotation,
+                    )
+                )
+                envelope_available = True
+            except Exception as exc:
+                errors.append(f"rotation-safe envelope query failed: {exc}")
+            try:
+                shape_hits, shape_saturated = self._sweep_exact_shapes(
                     state,
-                    direction_unit=tuple(-value for value in motion.direction_unit),
+                    direction_unit=tuple(-value for value in world_direction),
                     distance_m=motion.distance_m,
                 )
-                sweep_available = True
+                shape_available = True
             except Exception as exc:
-                errors.append(f"sweep query failed: {exc}")
+                diagnostic_errors.append(f"exact shape sweep failed: {exc}")
 
         result = classify_update(
             sensor_path=state.sensor_path,
@@ -234,9 +273,9 @@ class PhysxContinuousCollisionProbe:
             current_filter=current_filter,
             previous_endpoint_contact=state.previous_endpoint_contact,
             current_endpoint_contact=current_endpoint,
-            sweep_hits=sweep_hits,
-            sweep_query_available=sweep_available,
-            sweep_saturated=sweep_saturated,
+            sweep_hits=envelope_hits,
+            sweep_query_available=envelope_available,
+            sweep_saturated=envelope_saturated,
             max_sweep_hits=self.settings.max_hits_per_pair,
             maximum_sensor_rotation_radians=(self.settings.maximum_sensor_rotation_rad),
             maximum_filter_rotation_radians=(self.settings.maximum_filter_rotation_rad),
@@ -250,8 +289,19 @@ class PhysxContinuousCollisionProbe:
             "current_contact_or_overlap": current_endpoint,
         }
         result["sweep_semantics"] = (
-            "current_sensor_shapes_backward_through_relative_translation"
+            "rotation_safe_sensor_body_obb_backward_in_current_filter_frame"
         )
+        result["rotation_envelope"] = envelope_metadata
+        result["translation_shape_sweep"] = bounded_sweep_hits(
+            shape_hits,
+            max_hits=self.settings.max_hits_per_pair,
+            query_available=shape_available,
+            saturated=shape_saturated,
+        )
+        result["translation_shape_sweep_semantics"] = (
+            "current_sensor_collision_shapes_backward_through_relative_translation"
+        )
+        result["diagnostic_errors"] = diagnostic_errors
 
         state.previous_sensor_pose = current_sensor
         state.previous_filter_pose = current_filter
@@ -350,14 +400,14 @@ class PhysxContinuousCollisionProbe:
                 return True
         return False
 
-    def _sweep_pair(
+    def _sweep_exact_shapes(
         self,
         state: _PairState,
         *,
         direction_unit: tuple[float, float, float],
         distance_m: float,
     ) -> tuple[list[dict[str, Any]], bool]:
-        if distance_m <= 1.0e-12:
+        if distance_m <= _MOTION_EPSILON_M:
             return [], False
         direction = self._vec3(*direction_unit)
         distance_stage_units = distance_m / float(self._meters_per_unit)
@@ -397,6 +447,205 @@ class PhysxContinuousCollisionProbe:
             if saturated:
                 break
         return hits, saturated
+
+    def _query_rotation_envelope(
+        self,
+        state: _PairState,
+        *,
+        current_sensor: RigidBodyPose,
+        direction_unit: tuple[float, float, float],
+        distance_m: float,
+        relative_rotation_rad: float,
+    ) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+        radius_m = math.sqrt(
+            sum(value * value for value in state.sensor_half_extents_m)
+        )
+        inflation_m = 2.0 * radius_m * math.sin(relative_rotation_rad / 2.0)
+        query_half_extents_m = tuple(
+            value + inflation_m for value in state.sensor_half_extents_m
+        )
+        scale = float(self._meters_per_unit)
+        half_extents = self._vec3(*(value / scale for value in query_half_extents_m))
+        position = self._vec3(*(value / scale for value in current_sensor.position_m))
+        w, x, y, z = current_sensor.orientation_wxyz
+        rotation = self._quat_xyzw(x, y, z, w)
+        hits: list[dict[str, Any]] = []
+        saturated = False
+
+        def report(hit: Any) -> bool:
+            nonlocal saturated
+            if str(getattr(hit, "rigid_body", "")) != state.filter_path:
+                return True
+            if len(hits) >= self.settings.max_hits_per_pair:
+                saturated = True
+                return False
+            raw_distance = getattr(hit, "distance", 0.0)
+            distance = float(raw_distance)
+            if not math.isfinite(distance) or distance < 0:
+                raise RuntimeError("rotation envelope returned an invalid hit distance")
+            collision = str(getattr(hit, "collision", "")) or None
+            hits.append(
+                {
+                    "rigid_body_path": state.filter_path,
+                    "collider_path": collision,
+                    "distance_m": distance * scale,
+                }
+            )
+            return True
+
+        if distance_m > _MOTION_EPSILON_M:
+            query_kind = "sweep_box_all"
+            self._scene_query.sweep_box_all(
+                half_extents,
+                position,
+                rotation,
+                self._vec3(*direction_unit),
+                distance_m / scale,
+                report,
+                False,
+            )
+        else:
+            query_kind = "overlap_box"
+            self._scene_query.overlap_box(
+                half_extents,
+                position,
+                rotation,
+                report,
+                False,
+            )
+
+        return (
+            hits,
+            saturated,
+            {
+                "method": _ENVELOPE_METHOD,
+                "base_half_extents_m": list(state.sensor_half_extents_m),
+                "radius_m": radius_m,
+                "relative_rotation_rad": relative_rotation_rad,
+                "inflation_m": inflation_m,
+                "query_half_extents_m": list(query_half_extents_m),
+                "query_kind": query_kind,
+            },
+        )
+
+    def _sensor_half_extents_m(
+        self,
+        sensor_path: str,
+        collider_paths: Sequence[str],
+    ) -> tuple[float, float, float]:
+        if self._envelope_resolver is not None:
+            raw_extents = self._envelope_resolver(sensor_path, collider_paths)
+        else:
+            raw_extents = self._resolve_sensor_half_extents_m(
+                sensor_path,
+                collider_paths,
+            )
+        try:
+            half_extents = tuple(float(raw_extents[index]) for index in range(3))
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "continuous collision sensor envelope must contain three extents"
+            ) from exc
+        if not all(math.isfinite(value) and value > 0 for value in half_extents):
+            raise ValueError(
+                "continuous collision sensor envelope extents must be finite and positive"
+            )
+        return (half_extents[0], half_extents[1], half_extents[2])
+
+    def _resolve_sensor_half_extents_m(
+        self,
+        sensor_path: str,
+        collider_paths: Sequence[str],
+    ) -> tuple[float, float, float]:
+        from pxr import Usd, UsdGeom
+
+        sensor = self._stage.GetPrimAtPath(sensor_path)
+        sensor_world_transform = UsdGeom.XformCache(
+            Usd.TimeCode.Default()
+        ).GetLocalToWorldTransform(sensor)
+        if not self._has_rigid_linear_transform(sensor_world_transform):
+            raise ValueError(
+                "continuous collision sensor world transform contains "
+                f"scale, shear, or reflection: {sensor_path}"
+            )
+        purposes = [
+            UsdGeom.Tokens.default_,
+            UsdGeom.Tokens.render,
+            UsdGeom.Tokens.proxy,
+            UsdGeom.Tokens.guide,
+        ]
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            purposes,
+            False,
+            True,
+        )
+        minimum = [math.inf, math.inf, math.inf]
+        maximum = [-math.inf, -math.inf, -math.inf]
+        for collider_path in collider_paths:
+            collider = self._stage.GetPrimAtPath(collider_path)
+            current = collider
+            while current.IsValid() and current != sensor:
+                xformable = UsdGeom.Xformable(current)
+                if xformable and xformable.TransformMightBeTimeVarying():
+                    raise ValueError(
+                        "continuous collision sensor envelope contains a "
+                        f"time-varying descendant transform: {current.GetPath()}"
+                    )
+                current = current.GetParent()
+            if current != sensor:
+                raise ValueError(
+                    "continuous collision collider is not beneath the sensor: "
+                    f"{collider_path}"
+                )
+            aligned_range = cache.ComputeRelativeBound(
+                collider,
+                sensor,
+            ).ComputeAlignedRange()
+            if aligned_range.IsEmpty():
+                raise ValueError(
+                    f"continuous collision collider bound is empty: {collider_path}"
+                )
+            lower = aligned_range.GetMin()
+            upper = aligned_range.GetMax()
+            for axis in range(3):
+                lower_value = float(lower[axis])
+                upper_value = float(upper[axis])
+                if not math.isfinite(lower_value) or not math.isfinite(upper_value):
+                    raise ValueError(
+                        "continuous collision collider bound is non-finite: "
+                        f"{collider_path}"
+                    )
+                minimum[axis] = min(minimum[axis], lower_value)
+                maximum[axis] = max(maximum[axis], upper_value)
+        scale = float(self._meters_per_unit)
+        return tuple(
+            max(abs(minimum[axis]), abs(maximum[axis])) * scale for axis in range(3)
+        )
+
+    @staticmethod
+    def _has_rigid_linear_transform(matrix: Any) -> bool:
+        rows = [
+            tuple(float(value) for value in matrix.GetRow3(axis)) for axis in range(3)
+        ]
+        if not all(math.isfinite(value) for row in rows for value in row):
+            return False
+        tolerance = 1.0e-6
+        for row in rows:
+            norm = math.sqrt(sum(value * value for value in row))
+            if abs(norm - 1.0) > tolerance:
+                return False
+        for left in range(3):
+            for right in range(left + 1, 3):
+                dot = sum(rows[left][axis] * rows[right][axis] for axis in range(3))
+                if abs(dot) > tolerance:
+                    return False
+        determinant = (
+            rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+            - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+            + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+        )
+        return abs(determinant - 1.0) <= tolerance
 
     def _resolve_sensor_colliders(self, sensor_path: str) -> Sequence[str]:
         if self._collider_resolver is not None:
@@ -453,9 +702,7 @@ class PhysxContinuousCollisionProbe:
                 raise ValueError(
                     f"continuous collision collider prim not found: {collider_path}"
                 )
-            if not prim.IsA(UsdGeom.Gprim) or not prim.HasAPI(
-                UsdPhysics.CollisionAPI
-            ):
+            if not prim.IsA(UsdGeom.Gprim) or not prim.HasAPI(UsdPhysics.CollisionAPI):
                 raise ValueError(
                     "continuous collision collider must be a GPrim with a direct "
                     f"CollisionAPI: {collider_path}"
@@ -495,6 +742,13 @@ class PhysxContinuousCollisionProbe:
     def _vec3(self, x: float, y: float, z: float) -> Any:
         if self._vector_factory is not None:
             return self._vector_factory(x, y, z)
-        from pxr import Gf
+        import carb
 
-        return Gf.Vec3f(x, y, z)
+        return carb.Float3(x, y, z)
+
+    def _quat_xyzw(self, x: float, y: float, z: float, w: float) -> Any:
+        if self._quaternion_factory is not None:
+            return self._quaternion_factory(x, y, z, w)
+        import carb
+
+        return carb.Float4(x, y, z, w)
