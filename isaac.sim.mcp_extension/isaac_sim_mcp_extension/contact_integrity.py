@@ -9,10 +9,11 @@ from typing import Any, Dict, List, Mapping, Sequence
 import numpy as np
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_PAIRS = 16
 _MAX_CONTACTS_PER_PAIR = 256
 _MAX_CONTACT_RECORD_SLOTS = 8192
+_TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS = 1.0e-6
 
 
 def _tensor_to_array(value: Any) -> np.ndarray:
@@ -48,6 +49,7 @@ class ContactPair:
     label: str
     sensor_path: str
     filter_path: str
+    sensor_collider_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class ContactIntegrityConfig:
     max_contacts_per_pair: int
     maximum_penetration_m: float | None
     maximum_normal_impulse_ns: float | None
+    continuous_collision: Dict[str, Any] | None
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "ContactIntegrityConfig":
@@ -96,8 +99,46 @@ class ContactIntegrityConfig:
                 )
             if label in labels:
                 raise ValueError(f"duplicate contact integrity pair label: {label}")
+            raw_colliders = item.get("sensor_collider_paths", ())
+            if not isinstance(raw_colliders, Sequence) or isinstance(
+                raw_colliders, (str, bytes)
+            ):
+                raise ValueError(
+                    "contact_integrity.pairs"
+                    f"[{index}].sensor_collider_paths must be a list"
+                )
+            if len(raw_colliders) > 32:
+                raise ValueError(
+                    "contact integrity sensor collider paths must contain at most 32 entries"
+                )
+            colliders: list[str] = []
+            for collider_index, collider_path in enumerate(raw_colliders):
+                if (
+                    not isinstance(collider_path, str)
+                    or not collider_path.startswith("/")
+                    or not collider_path.strip()
+                ):
+                    raise ValueError(
+                        "contact_integrity.pairs"
+                        f"[{index}].sensor_collider_paths[{collider_index}] "
+                        "must be an absolute USD path"
+                    )
+                if collider_path in colliders:
+                    raise ValueError(
+                        "duplicate contact integrity sensor collider path: "
+                        f"{collider_path}"
+                    )
+                if not (
+                    collider_path == sensor_path
+                    or collider_path.startswith(sensor_path.rstrip("/") + "/")
+                ):
+                    raise ValueError(
+                        "contact integrity sensor collider paths must be beneath "
+                        f"the sensor rigid body: {collider_path}"
+                    )
+                colliders.append(collider_path)
             labels.add(label)
-            pairs.append(ContactPair(label, sensor_path, filter_path))
+            pairs.append(ContactPair(label, sensor_path, filter_path, tuple(colliders)))
 
         max_contacts = raw.get("max_contacts_per_pair", 64)
         if isinstance(max_contacts, bool) or not isinstance(max_contacts, int):
@@ -134,11 +175,74 @@ class ContactIntegrityConfig:
                 )
             return result
 
+        raw_continuous = raw.get("continuous_collision")
+        continuous: Dict[str, Any] | None = None
+        if raw_continuous is not None:
+            if not isinstance(raw_continuous, Mapping):
+                raise ValueError(
+                    "contact_integrity.continuous_collision must be an object"
+                )
+            supported = {
+                "maximum_sensor_rotation_rad",
+                "maximum_filter_rotation_rad",
+                "max_hits_per_pair",
+            }
+            unknown = set(raw_continuous) - supported
+            if unknown:
+                raise ValueError(
+                    "unsupported continuous collision options: "
+                    + ", ".join(sorted(str(name) for name in unknown))
+                )
+            for name in (
+                "maximum_sensor_rotation_rad",
+                "maximum_filter_rotation_rad",
+            ):
+                value = raw_continuous.get(name)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"continuous_collision.{name} must be a number")
+                if not math.isfinite(float(value)) or not 0 <= float(value) <= math.pi:
+                    raise ValueError(
+                        f"continuous_collision.{name} must be finite and between 0 and pi"
+                    )
+                if float(value) > _TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
+                    raise ValueError(
+                        f"continuous_collision.{name} must not exceed the "
+                        "translation-only certification epsilon"
+                    )
+            max_hits = raw_continuous.get("max_hits_per_pair")
+            if max_hits is not None and (
+                isinstance(max_hits, bool)
+                or not isinstance(max_hits, int)
+                or not 1 <= max_hits <= 64
+            ):
+                raise ValueError(
+                    "continuous_collision.max_hits_per_pair must be an integer "
+                    "between 1 and 64"
+                )
+            continuous = {
+                "maximum_sensor_rotation_rad": float(
+                    raw_continuous.get(
+                        "maximum_sensor_rotation_rad",
+                        _TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS,
+                    )
+                ),
+                "maximum_filter_rotation_rad": float(
+                    raw_continuous.get(
+                        "maximum_filter_rotation_rad",
+                        _TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS,
+                    )
+                ),
+                "max_hits_per_pair": int(raw_continuous.get("max_hits_per_pair", 16)),
+            }
+
         return cls(
             tuple(pairs),
             max_contacts,
             optional_limit("maximum_penetration_m"),
             optional_limit("maximum_normal_impulse_ns"),
+            continuous,
         )
 
 
@@ -153,6 +257,8 @@ class ContactIntegritySampler:
         self._errors: list[str] = []
         self._saturated_pairs: set[str] = set()
         self._violations: list[Dict[str, Any]] = []
+        self._continuous_probe: Any | None = None
+        self._continuous_incomplete_pairs: set[str] = set()
 
     def validate_request_size(self, requested_updates: int) -> None:
         """Reject traces whose worst-case response would exceed the hard budget."""
@@ -173,12 +279,34 @@ class ContactIntegritySampler:
                 "contact integrity request exceeds the bounded response budget: "
                 f"{record_slots} > {_MAX_CONTACT_RECORD_SLOTS} contact slots"
             )
+        if self.config.continuous_collision is not None:
+            max_hits = self.config.continuous_collision.get("max_hits_per_pair", 16)
+            sweep_slots = requested_updates * len(self.config.pairs) * int(max_hits)
+            if sweep_slots > _MAX_CONTACT_RECORD_SLOTS:
+                raise ValueError(
+                    "continuous collision request exceeds the bounded response budget: "
+                    f"{sweep_slots} > {_MAX_CONTACT_RECORD_SLOTS} sweep slots"
+                )
 
     def prepare(self) -> None:
         """Validate exact paths and enable bounded contact reporting."""
 
         from isaacsim.core.experimental.prims import RigidPrim
         from pxr import PhysxSchema, UsdPhysics
+
+        if self.config.continuous_collision is not None:
+            from .continuous_collision_physx import (
+                ContinuousCollisionSettings,
+                PhysxContinuousCollisionProbe,
+            )
+
+            settings = ContinuousCollisionSettings.parse(
+                self.config.continuous_collision
+            )
+            self._continuous_probe = PhysxContinuousCollisionProbe(
+                self._stage,
+                settings,
+            )
 
         for pair in self.config.pairs:
             sensor = self._stage.GetPrimAtPath(pair.sensor_path)
@@ -202,6 +330,13 @@ class ContactIntegritySampler:
             )
             view.set_enabled_contact_tracking([True])
             self._views.append((pair, view))
+            if self._continuous_probe is not None:
+                self._continuous_probe.prepare_pair(
+                    label=pair.label,
+                    sensor_path=pair.sensor_path,
+                    filter_path=pair.filter_path,
+                    sensor_collider_paths=pair.sensor_collider_paths,
+                )
 
     def sample(self, *, update_index: int, physics_dt_seconds: float) -> None:
         """Copy the transient contact manifold after one requested update."""
@@ -213,22 +348,43 @@ class ContactIntegritySampler:
         for pair, view in self._views:
             try:
                 record = self._sample_pair(pair, view, physics_dt_seconds)
-                pair_records.append(record)
                 self._record_limit_violations(update_index, pair, record)
             except Exception as exc:
                 message = f"{pair.label}: {exc}"
                 self._errors.append(message)
-                pair_records.append(
-                    {
-                        "label": pair.label,
-                        "sensor_path": pair.sensor_path,
-                        "filter_path": pair.filter_path,
+                record = {
+                    "label": pair.label,
+                    "sensor_path": pair.sensor_path,
+                    "filter_path": pair.filter_path,
+                    "complete": False,
+                    "error": str(exc),
+                    "contacts": [],
+                    "friction_contacts": [],
+                }
+            if self._continuous_probe is not None:
+                try:
+                    continuous = self._continuous_probe.sample_pair(
+                        label=pair.label,
+                        current_manifold_contact=bool(record["contacts"]),
+                    )
+                except Exception as exc:
+                    continuous = {
                         "complete": False,
-                        "error": str(exc),
-                        "contacts": [],
-                        "friction_contacts": [],
+                        "passed": False,
+                        "tunneling_detected": False,
+                        "failure_reasons": ["continuous_collision_probe_failed"],
+                        "errors": [str(exc)],
                     }
+                record["continuous_collision"] = continuous
+                record["complete"] = bool(record.get("complete")) and bool(
+                    continuous.get("complete")
                 )
+                self._record_continuous_collision(
+                    update_index,
+                    pair,
+                    continuous,
+                )
+            pair_records.append(record)
         self._samples.append(
             {
                 "update_index": update_index,
@@ -389,12 +545,42 @@ class ContactIntegritySampler:
                     }
                 )
 
+    def _record_continuous_collision(
+        self,
+        update_index: int,
+        pair: ContactPair,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        if evidence.get("complete") is not True:
+            self._continuous_incomplete_pairs.add(pair.label)
+            reasons = evidence.get("failure_reasons")
+            detail = ", ".join(str(item) for item in reasons or [])
+            self._errors.append(
+                f"{pair.label}: continuous collision evidence incomplete"
+                + (f" ({detail})" if detail else "")
+            )
+        if evidence.get("tunneling_detected") is True:
+            observed = int(evidence.get("paired_hit_count", 1))
+            self._violations.append(
+                {
+                    "update_index": update_index,
+                    "pair_label": pair.label,
+                    "metric": "unreported_swept_collision",
+                    "observed": observed,
+                    "limit": 0,
+                }
+            )
+
     def result(
         self, *, requested_updates: int, physics_dt_seconds: float
     ) -> Dict[str, Any]:
         maximum_penetration = 0.0
         maximum_normal_impulse = 0.0
         contact_updates = 0
+        unreported_swept_collisions = 0
+        maximum_relative_translation = 0.0
+        maximum_sensor_rotation = 0.0
+        maximum_filter_rotation = 0.0
         for sample in self._samples:
             sample_has_contact = False
             for pair in sample["pairs"]:
@@ -407,11 +593,33 @@ class ContactIntegritySampler:
                     float(pair.get("maximum_normal_impulse_ns", 0.0)),
                 )
                 sample_has_contact = sample_has_contact or bool(pair.get("contacts"))
+                continuous = pair.get("continuous_collision")
+                if isinstance(continuous, Mapping):
+                    unreported_swept_collisions += int(
+                        continuous.get("tunneling_detected") is True
+                    )
+                    motion = continuous.get("relative_motion")
+                    if isinstance(motion, Mapping):
+                        maximum_relative_translation = max(
+                            maximum_relative_translation,
+                            float(motion.get("distance_m", 0.0)),
+                        )
+                    rotations = continuous.get("rotation_delta_radians")
+                    if isinstance(rotations, Mapping):
+                        maximum_sensor_rotation = max(
+                            maximum_sensor_rotation,
+                            float(rotations.get("sensor", 0.0)),
+                        )
+                        maximum_filter_rotation = max(
+                            maximum_filter_rotation,
+                            float(rotations.get("filter", 0.0)),
+                        )
             contact_updates += int(sample_has_contact)
         complete = (
             len(self._samples) == requested_updates
             and not self._errors
             and not self._saturated_pairs
+            and not self._continuous_incomplete_pairs
         )
         limits = {
             key: value
@@ -424,26 +632,60 @@ class ContactIntegritySampler:
             )
             if value is not None
         }
+        if self.config.continuous_collision is not None:
+            limits.update(
+                {
+                    "maximum_sensor_rotation_rad_per_update": (
+                        self.config.continuous_collision["maximum_sensor_rotation_rad"]
+                    ),
+                    "maximum_filter_rotation_rad_per_update": (
+                        self.config.continuous_collision["maximum_filter_rotation_rad"]
+                    ),
+                    "unreported_swept_collisions": 0,
+                }
+            )
+        summary = {
+            "updates_with_contact": contact_updates,
+            "maximum_penetration_m": maximum_penetration,
+            "maximum_normal_impulse_ns": maximum_normal_impulse,
+        }
+        if self.config.continuous_collision is not None:
+            summary.update(
+                {
+                    "unreported_swept_collisions": unreported_swept_collisions,
+                    "maximum_relative_translation_m": maximum_relative_translation,
+                    "maximum_sensor_rotation_rad": maximum_sensor_rotation,
+                    "maximum_filter_rotation_rad": maximum_filter_rotation,
+                }
+            )
         return {
             "schema_version": _SCHEMA_VERSION,
-            "capture_source": "isaacsim.core.experimental.prims.RigidPrim",
-            "sampling_semantics": "after_each_requested_kit_update",
+            "capture_source": (
+                "isaacsim.core.experimental.prims.RigidPrim"
+                if self.config.continuous_collision is None
+                else "RigidPrim_contact_tensors_and_PhysX_scene_queries"
+            ),
+            "sampling_semantics": (
+                "after_each_requested_kit_update"
+                if self.config.continuous_collision is None
+                else "initial_endpoint_overlap_then_pose_contact_and_relative_shape_sweep_after_each_update"
+            ),
             "physics_dt_seconds": physics_dt_seconds,
             "requested_updates": requested_updates,
             "captured_updates": len(self._samples),
             "complete": complete,
             "errors": list(self._errors),
             "saturated_pairs": sorted(self._saturated_pairs),
+            "continuous_collision_incomplete_pairs": sorted(
+                self._continuous_incomplete_pairs
+            ),
             "limits": limits,
+            "continuous_collision": self.config.continuous_collision,
             "within_configured_limits": (
                 complete and not self._violations if limits else None
             ),
             "violations": list(self._violations),
-            "summary": {
-                "updates_with_contact": contact_updates,
-                "maximum_penetration_m": maximum_penetration,
-                "maximum_normal_impulse_ns": maximum_normal_impulse,
-            },
+            "summary": summary,
             "samples": self._samples,
         }
 
@@ -455,3 +697,6 @@ class ContactIntegritySampler:
             if callable(destroy):
                 destroy()
         self._views.clear()
+        if self._continuous_probe is not None:
+            self._continuous_probe.close()
+            self._continuous_probe = None
