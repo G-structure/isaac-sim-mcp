@@ -651,7 +651,7 @@ class PhysxContinuousCollisionProbe:
         if self._collider_resolver is not None:
             return self._collider_resolver(sensor_path)
 
-        from pxr import UsdGeom, UsdPhysics
+        from pxr import UsdPhysics
 
         root = self._stage.GetPrimAtPath(sensor_path)
         if not root.IsValid():
@@ -663,7 +663,9 @@ class PhysxContinuousCollisionProbe:
         def visit(prim: Any) -> None:
             if prim != root and prim.HasAPI(UsdPhysics.RigidBodyAPI):
                 return
-            if prim.IsA(UsdGeom.Gprim) and prim.HasAPI(UsdPhysics.CollisionAPI):
+            # Imported robot assets may put CollisionAPI on an Xform shape
+            # carrier while a descendant Mesh supplies the geometry.
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
                 collision_enabled = (
                     UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
                 )
@@ -680,7 +682,7 @@ class PhysxContinuousCollisionProbe:
         sensor_path: str,
         collider_paths: Sequence[str],
     ) -> None:
-        from pxr import UsdGeom, UsdPhysics
+        from pxr import UsdPhysics
 
         seen: set[str] = set()
         descendant_prefix = sensor_path.rstrip("/") + "/"
@@ -702,9 +704,9 @@ class PhysxContinuousCollisionProbe:
                 raise ValueError(
                     f"continuous collision collider prim not found: {collider_path}"
                 )
-            if not prim.IsA(UsdGeom.Gprim) or not prim.HasAPI(UsdPhysics.CollisionAPI):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
                 raise ValueError(
-                    "continuous collision collider must be a GPrim with a direct "
+                    "continuous collision collider must have a direct "
                     f"CollisionAPI: {collider_path}"
                 )
             collision_enabled = (
