@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, TypedDict
 _SCHEMA_VERSION = 1
 _MAX_SWEEP_HITS = 256
 _QUATERNION_NORM_TOLERANCE = 1.0e-3
+TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,7 @@ class ContinuousCollisionClassification(TypedDict):
     current_endpoint_contact: bool | None
     poses: dict[str, dict[str, list[float]] | None]
     rotation_delta_radians: dict[str, float] | None
-    maximum_rotation_radians: float
+    maximum_rotation_radians: dict[str, float]
     relative_motion: dict[str, Any] | None
     sweep: SweepEvidence
     paired_hit_count: int
@@ -140,6 +141,7 @@ __all__ = [
     "RigidBodyPose",
     "SweepEvidence",
     "SweepHitRecord",
+    "TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS",
     "bounded_sweep_hits",
     "classify_update",
     "quaternion_angular_delta_radians",
@@ -356,7 +358,8 @@ def classify_update(
     current_endpoint_contact: bool | None,
     sweep_hits: Iterable[Mapping[str, Any]] | None,
     sweep_query_available: bool,
-    maximum_rotation_radians: float,
+    maximum_sensor_rotation_radians: float,
+    maximum_filter_rotation_radians: float,
     max_sweep_hits: int = 64,
     sweep_saturated: bool = False,
 ) -> ContinuousCollisionClassification:
@@ -367,12 +370,28 @@ def classify_update(
     if sensor == filtered:
         raise ValueError("sensor_path and filter_path must differ")
     capacity = _validated_max_hits(max_sweep_hits)
-    rotation_limit = _finite_nonnegative(
-        maximum_rotation_radians,
-        field="maximum_rotation_radians",
+    sensor_rotation_limit = _finite_nonnegative(
+        maximum_sensor_rotation_radians,
+        field="maximum_sensor_rotation_radians",
     )
-    if rotation_limit > math.pi:
-        raise ValueError("maximum_rotation_radians must not exceed pi")
+    filter_rotation_limit = _finite_nonnegative(
+        maximum_filter_rotation_radians,
+        field="maximum_filter_rotation_radians",
+    )
+    if sensor_rotation_limit > math.pi:
+        raise ValueError("maximum_sensor_rotation_radians must not exceed pi")
+    if filter_rotation_limit > math.pi:
+        raise ValueError("maximum_filter_rotation_radians must not exceed pi")
+    if sensor_rotation_limit > TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
+        raise ValueError(
+            "maximum_sensor_rotation_radians must not exceed the "
+            "translation-only certification epsilon"
+        )
+    if filter_rotation_limit > TRANSLATION_SWEEP_ROTATION_EPSILON_RADIANS:
+        raise ValueError(
+            "maximum_filter_rotation_radians must not exceed the "
+            "translation-only certification epsilon"
+        )
 
     failure_reasons: list[str] = []
     errors: list[str] = []
@@ -462,14 +481,15 @@ def classify_update(
             previous_filter_pose.orientation_wxyz,
             current_filter_pose.orientation_wxyz,
         )
-        maximum_rotation = max(sensor_rotation, filter_rotation)
         rotation_deltas = {
             "sensor": sensor_rotation,
             "filter": filter_rotation,
-            "maximum": maximum_rotation,
+            "maximum": max(sensor_rotation, filter_rotation),
         }
-        if maximum_rotation > rotation_limit:
-            fail("rotation_limit_exceeded")
+        if sensor_rotation > sensor_rotation_limit:
+            fail("sensor_rotation_limit_exceeded")
+        if filter_rotation > filter_rotation_limit:
+            fail("filter_rotation_limit_exceeded")
 
     paired_hit_count = sum(hit["rigid_body_path"] == filtered for hit in sweep["hits"])
     tunneling_detected = (
@@ -482,7 +502,8 @@ def classify_update(
         "endpoint_contact_evidence_unavailable",
         "pose_evidence_invalid",
         "pose_evidence_unavailable",
-        "rotation_limit_exceeded",
+        "filter_rotation_limit_exceeded",
+        "sensor_rotation_limit_exceeded",
         "sweep_hits_saturated",
         "sweep_query_evidence_invalid",
         "sweep_query_unavailable",
@@ -513,7 +534,10 @@ def classify_update(
             for name, pose in poses.items()
         },
         "rotation_delta_radians": rotation_deltas,
-        "maximum_rotation_radians": rotation_limit,
+        "maximum_rotation_radians": {
+            "sensor": sensor_rotation_limit,
+            "filter": filter_rotation_limit,
+        },
         "relative_motion": motion.to_dict() if motion is not None else None,
         "sweep": sweep,
         "paired_hit_count": paired_hit_count,

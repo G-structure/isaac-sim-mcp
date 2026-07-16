@@ -49,7 +49,8 @@ def _classify(**overrides):
         "sweep_query_available": True,
         "sweep_saturated": False,
         "max_sweep_hits": 8,
-        "maximum_rotation_radians": 0.25,
+        "maximum_sensor_rotation_radians": 1.0e-6,
+        "maximum_filter_rotation_radians": 1.0e-6,
     }
     values.update(overrides)
     return continuous_collision.classify_update(**values)
@@ -114,7 +115,7 @@ def test_endpoint_contact_accounts_for_paired_sweep_hit() -> None:
 
 
 def test_rotation_above_translation_sweep_limit_fails_closed() -> None:
-    angle = 0.3
+    angle = 0.01
     result = _classify(
         current_sensor=_pose(
             0.1,
@@ -125,14 +126,18 @@ def test_rotation_above_translation_sweep_limit_fails_closed() -> None:
                 math.sin(angle / 2.0),
             ],
         ),
-        maximum_rotation_radians=0.2,
     )
 
     assert result["classification"] == "indeterminate"
     assert result["passed"] is False
     assert result["complete"] is False
-    assert result["failure_reasons"] == ["rotation_limit_exceeded"]
+    assert result["failure_reasons"] == ["sensor_rotation_limit_exceeded"]
     assert result["rotation_delta_radians"]["sensor"] == pytest.approx(angle)
+
+
+def test_translation_only_contract_rejects_unsafe_rotation_allowance() -> None:
+    with pytest.raises(ValueError, match="translation-only certification epsilon"):
+        _classify(maximum_sensor_rotation_radians=0.01)
 
 
 @pytest.mark.parametrize(

@@ -178,6 +178,11 @@ The Isaac Sim MCP Extension provides several specialized tools that can be acces
       "maximum_penetration_m": 0.001,
       "maximum_normal_impulse_ns": 0.5
     },
+    "continuous_collision": {
+      "maximum_sensor_rotation_rad": 0.000001,
+      "maximum_filter_rotation_rad": 0.000001,
+      "max_hits_per_pair": 16
+    },
     "pairs": [
       {
         "label": "left-finger-cube",
@@ -202,6 +207,24 @@ trace preserves the readable bounded prefix and names the pair in
 machine-readable physics-quality verdict without relying on rendered frames.
 The product of updates, pairs, and per-pair capacity may not exceed 8192 contact
 slots, so an untrusted caller cannot request an unbounded in-memory trace.
+
+When `continuous_collision` is present, the extension also copies exact PhysX
+rigid-body poses before the first update and after every requested update. For
+each pair it discovers the sensor body's collision GPrims, checks both endpoint
+overlaps, and sweeps each current sensor shape backward through the sensor's
+translation relative to the filter body. A paired-body sweep hit with neither
+endpoint in contact or overlap is reported as
+`unreported_swept_collision`, covering the case where a fast finger crosses an
+object between sampled contact manifolds. The translation sweep records both
+body poses, relative motion, hit distance, collider path, and separate sensor
+and filter rotation deltas. Evidence fails closed when transforms or scene
+queries are unavailable, a sweep buffer saturates, or either body rotates beyond
+the one-microradian numerical epsilon. Rotation is never certified by a
+translation-only query. Automatic discovery and optional
+`sensor_collider_paths` overrides accept only enabled GPrims with a directly
+applied CollisionAPI whose closest rigid-body ancestor is the declared sensor;
+visual, disabled, and nested-body geometry is rejected. The total response
+remains bounded by the same 8192-slot budget.
 
 `get_physics_state` now reads rigid-body velocity from an exact PhysX tensor
 view. It reports `velocity_complete=false` rather than substituting zero when a

@@ -76,24 +76,42 @@ def _sampler(
     max_contacts: int = 64,
     view: FakeContactView | None = None,
     limits: dict[str, float] | None = None,
+    continuous_collision: dict[str, object] | None = None,
 ):
+    config = {
+        "pairs": [
+            {
+                "label": "left-cube",
+                "sensor_path": "/World/left_finger",
+                "filter_path": "/World/cube",
+            }
+        ],
+        "max_contacts_per_pair": max_contacts,
+        "limits": limits or {},
+    }
+    if continuous_collision is not None:
+        config["continuous_collision"] = continuous_collision
     sampler = contact_integrity.ContactIntegritySampler(
         None,
-        {
-            "pairs": [
-                {
-                    "label": "left-cube",
-                    "sensor_path": "/World/left_finger",
-                    "filter_path": "/World/cube",
-                }
-            ],
-            "max_contacts_per_pair": max_contacts,
-            "limits": limits or {},
-        },
+        config,
     )
     pair = sampler.config.pairs[0]
     sampler._views = [(pair, view or FakeContactView())]
     return sampler
+
+
+class FakeContinuousProbe:
+    def __init__(self, evidence: dict[str, object]) -> None:
+        self.evidence = evidence
+        self.closed = False
+
+    def sample_pair(self, *, label: str, current_manifold_contact: bool):
+        assert label == "left-cube"
+        assert current_manifold_contact is True
+        return dict(self.evidence)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_contact_trace_preserves_penetration_impulse_and_friction() -> None:
@@ -260,3 +278,95 @@ def test_contact_configuration_rejects_ambiguous_paths_and_labels() -> None:
                 "limits": {"maximum_penetraton_m": 0.001},
             }
         )
+    with pytest.raises(ValueError, match="must be beneath"):
+        contact_integrity.ContactIntegrityConfig.parse(
+            {
+                "pairs": [
+                    {
+                        "a": "/World/a",
+                        "b": "/World/b",
+                        "sensor_collider_paths": ["/World/unrelated/collision"],
+                    }
+                ]
+            }
+        )
+
+
+def test_continuous_collision_crossing_is_a_machine_readable_violation() -> None:
+    sampler = _sampler(
+        limits={"maximum_penetration_m": 0.01},
+        continuous_collision={"max_hits_per_pair": 8},
+    )
+    sampler._continuous_probe = FakeContinuousProbe(
+        {
+            "complete": True,
+            "passed": False,
+            "tunneling_detected": True,
+            "paired_hit_count": 1,
+            "failure_reasons": ["paired_body_sweep_hit_without_endpoint_contact"],
+            "errors": [],
+            "relative_motion": {"distance_m": 0.25},
+            "rotation_delta_radians": {"sensor": 0.01, "filter": 0.02},
+        }
+    )
+
+    sampler.sample(update_index=3, physics_dt_seconds=1.0 / 120.0)
+    result = sampler.result(requested_updates=1, physics_dt_seconds=1.0 / 120.0)
+
+    assert result["complete"] is True
+    assert result["within_configured_limits"] is False
+    assert result["summary"]["unreported_swept_collisions"] == 1
+    assert result["summary"]["maximum_relative_translation_m"] == pytest.approx(0.25)
+    assert result["violations"][-1] == {
+        "update_index": 3,
+        "pair_label": "left-cube",
+        "metric": "unreported_swept_collision",
+        "observed": 1,
+        "limit": 0,
+    }
+
+
+def test_incomplete_continuous_collision_evidence_fails_closed() -> None:
+    sampler = _sampler(continuous_collision={})
+    sampler._continuous_probe = FakeContinuousProbe(
+        {
+            "complete": False,
+            "passed": False,
+            "tunneling_detected": False,
+            "failure_reasons": ["sweep_query_unavailable"],
+            "errors": ["query unavailable"],
+        }
+    )
+
+    sampler.sample(update_index=0, physics_dt_seconds=1.0 / 120.0)
+    result = sampler.result(requested_updates=1, physics_dt_seconds=1.0 / 120.0)
+
+    assert result["complete"] is False
+    assert result["within_configured_limits"] is False
+    assert result["continuous_collision_incomplete_pairs"] == ["left-cube"]
+    assert "sweep_query_unavailable" in result["errors"][0]
+
+
+def test_continuous_collision_configuration_is_bounded_and_strict() -> None:
+    base = {"pairs": [{"a": "/World/a", "b": "/World/b"}]}
+    with pytest.raises(ValueError, match="unsupported continuous collision"):
+        contact_integrity.ContactIntegrityConfig.parse(
+            {**base, "continuous_collision": {"max_hitz": 4}}
+        )
+    with pytest.raises(ValueError, match="translation-only certification epsilon"):
+        contact_integrity.ContactIntegrityConfig.parse(
+            {
+                **base,
+                "continuous_collision": {"maximum_sensor_rotation_rad": 0.01},
+            }
+        )
+
+    sampler = contact_integrity.ContactIntegritySampler(
+        None,
+        {
+            **base,
+            "continuous_collision": {"max_hits_per_pair": 64},
+        },
+    )
+    with pytest.raises(ValueError, match="bounded response budget"):
+        sampler.validate_request_size(129)
