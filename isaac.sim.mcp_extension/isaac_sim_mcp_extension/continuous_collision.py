@@ -239,8 +239,11 @@ def quaternion_angular_delta_radians(
         end_orientation_wxyz,
         field="end_orientation_wxyz",
     )
-    absolute_dot = abs(sum(a * b for a, b in zip(start, end)))
-    return 2.0 * math.acos(min(1.0, max(0.0, absolute_dot)))
+    if sum(a * b for a, b in zip(start, end)) < 0.0:
+        end = [-component for component in end]
+    difference_norm = math.sqrt(sum((a - b) ** 2 for a, b in zip(start, end)))
+    sum_norm = math.sqrt(sum((a + b) ** 2 for a, b in zip(start, end)))
+    return 4.0 * math.atan2(difference_norm, sum_norm)
 
 
 def _quaternion_conjugate(

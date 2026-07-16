@@ -230,6 +230,23 @@ def test_quaternion_delta_uses_shortest_physical_rotation() -> None:
         [-1.0, 0.0, 0.0, 0.0],
     ) == pytest.approx(0.0)
 
+    tiny_rotation = 1.0e-9
+    assert continuous_collision.quaternion_angular_delta_radians(
+        [1.0, 0.0, 0.0, 0.0],
+        [math.cos(tiny_rotation / 2.0), math.sin(tiny_rotation / 2.0), 0.0, 0.0],
+    ) == pytest.approx(tiny_rotation, abs=1.0e-15)
+
+    awkward_orientation = [
+        0.4087861509214986,
+        -0.7399056725191926,
+        -0.4777720651757142,
+        -0.2390969099056692,
+    ]
+    assert continuous_collision.quaternion_angular_delta_radians(
+        awkward_orientation,
+        awkward_orientation,
+    ) == pytest.approx(0.0)
+
     with pytest.raises(ValueError, match="must not be zero"):
         continuous_collision.RigidBodyPose.parse(
             {
