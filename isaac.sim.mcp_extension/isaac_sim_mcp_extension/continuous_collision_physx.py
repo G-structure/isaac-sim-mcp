@@ -262,7 +262,10 @@ class PhysxContinuousCollisionProbe:
                     direction_unit=tuple(-value for value in world_direction),
                     distance_m=motion.distance_m,
                 )
-                shape_available = True
+                # This query sweeps translation only; a zero-distance update
+                # still needs a rotation-aware exact query before it can be
+                # treated as complete collision evidence.
+                shape_available = motion.distance_m > 1.0e-12
             except Exception as exc:
                 diagnostic_errors.append(f"exact shape sweep failed: {exc}")
 
@@ -278,6 +281,9 @@ class PhysxContinuousCollisionProbe:
             sweep_hits=envelope_hits,
             sweep_query_available=envelope_available,
             sweep_saturated=envelope_saturated,
+            exact_shape_hits=shape_hits,
+            exact_shape_query_available=shape_available,
+            exact_shape_saturated=shape_saturated,
             max_sweep_hits=self.settings.max_hits_per_pair,
             maximum_sensor_rotation_radians=(self.settings.maximum_sensor_rotation_rad),
             maximum_filter_rotation_radians=(self.settings.maximum_filter_rotation_rad),

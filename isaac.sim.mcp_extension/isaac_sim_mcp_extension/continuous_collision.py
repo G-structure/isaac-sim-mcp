@@ -131,6 +131,9 @@ class ContinuousCollisionClassification(TypedDict):
     relative_motion: dict[str, Any] | None
     sweep: SweepEvidence
     paired_hit_count: int
+    exact_shape_sweep: SweepEvidence
+    exact_paired_hit_count: int
+    broad_phase_only: bool
 
 
 PoseInput = RigidBodyPose | Mapping[str, Any]
@@ -497,8 +500,18 @@ def classify_update(
     maximum_filter_rotation_radians: float,
     max_sweep_hits: int = 64,
     sweep_saturated: bool = False,
+    exact_shape_hits: Iterable[Mapping[str, Any]] | None = None,
+    exact_shape_query_available: bool | None = None,
+    exact_shape_saturated: bool = False,
 ) -> ContinuousCollisionClassification:
-    """Classify one update, treating incomplete swept-volume evidence as failure."""
+    """Classify one update using exact-shape hits to confirm broad-phase risk.
+
+    The rotation-safe OBB sweep is intentionally conservative and can intersect
+    a paired body while the exact collision carriers do not. That condition is
+    retained as diagnostic ``broad_phase_only`` evidence, but it is not a
+    tunneling verdict. Exact-shape evidence is required to make the result
+    complete when the mechanism provides it.
+    """
 
     sensor = _absolute_path(sensor_path, field="sensor_path")
     filtered = _absolute_path(filter_path, field="filter_path")
@@ -580,6 +593,42 @@ def classify_update(
     if sweep["saturated"]:
         fail("sweep_hits_saturated")
 
+    exact_shape_evidence_supplied = not (
+        exact_shape_hits is None and exact_shape_query_available is None
+    )
+    if not exact_shape_evidence_supplied:
+        exact_shape_hits = sweep_hits
+        exact_shape_query_available = sweep_query_available
+        exact_shape_saturated = sweep_saturated
+    exact_shape_available = bool(exact_shape_query_available)
+    try:
+        exact_shape_sweep = bounded_sweep_hits(
+            exact_shape_hits,
+            max_hits=capacity,
+            query_available=exact_shape_available,
+            saturated=exact_shape_saturated,
+        )
+    except ValueError as exc:
+        exact_shape_sweep = {
+            "available": False,
+            "max_hits": capacity,
+            "captured_hit_count": 0,
+            "saturated": False,
+            "hits": [],
+        }
+        fail("exact_shape_sweep_query_invalid", str(exc))
+    if (
+        exact_shape_evidence_supplied
+        and not exact_shape_sweep["available"]
+        and sweep["captured_hit_count"] > 0
+    ):
+        fail(
+            "exact_shape_sweep_query_unavailable",
+            "exact collision-shape sweep evidence is unavailable",
+        )
+    if exact_shape_evidence_supplied and exact_shape_sweep["saturated"]:
+        fail("exact_shape_sweep_hits_saturated")
+
     motion: RelativeMotion | None = None
     rotation_deltas: dict[str, float] | None = None
     if all(pose is not None for pose in poses.values()):
@@ -624,8 +673,14 @@ def classify_update(
             fail("filter_rotation_limit_exceeded")
 
     paired_hit_count = sum(hit["rigid_body_path"] == filtered for hit in sweep["hits"])
+    exact_paired_hit_count = sum(
+        hit["rigid_body_path"] == filtered for hit in exact_shape_sweep["hits"]
+    )
+    broad_phase_only = paired_hit_count > 0 and exact_paired_hit_count == 0
     tunneling_detected = (
-        paired_hit_count > 0 and previous_contact is False and current_contact is False
+        exact_paired_hit_count > 0
+        and previous_contact is False
+        and current_contact is False
     )
     if tunneling_detected:
         fail("paired_body_sweep_hit_without_endpoint_contact")
@@ -639,12 +694,17 @@ def classify_update(
         "sweep_hits_saturated",
         "sweep_query_evidence_invalid",
         "sweep_query_unavailable",
+        "exact_shape_sweep_hits_saturated",
+        "exact_shape_sweep_query_invalid",
+        "exact_shape_sweep_query_unavailable",
     }
     complete = not any(reason in incomplete_reasons for reason in failure_reasons)
     passed = complete and not tunneling_detected
     classification = (
         "paired_tunneling"
         if tunneling_detected
+        else "conservative_envelope_only"
+        if broad_phase_only and complete
         else "clear"
         if passed
         else "indeterminate"
@@ -674,4 +734,7 @@ def classify_update(
         "relative_motion": motion.to_dict() if motion is not None else None,
         "sweep": sweep,
         "paired_hit_count": paired_hit_count,
+        "exact_shape_sweep": exact_shape_sweep,
+        "exact_paired_hit_count": exact_paired_hit_count,
+        "broad_phase_only": broad_phase_only,
     }
