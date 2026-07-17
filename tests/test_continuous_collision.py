@@ -206,6 +206,34 @@ def test_unavailable_pose_or_query_evidence_fails_closed(
     assert reason in result["failure_reasons"]
 
 
+def test_broad_phase_only_hit_is_diagnostic_not_tunneling() -> None:
+    result = _classify(
+        sweep_hits=[_hit("/World/cube")],
+        exact_shape_hits=[],
+        exact_shape_query_available=True,
+    )
+
+    assert result["classification"] == "conservative_envelope_only"
+    assert result["passed"] is True
+    assert result["complete"] is True
+    assert result["tunneling_detected"] is False
+    assert result["broad_phase_only"] is True
+    assert result["paired_hit_count"] == 1
+    assert result["exact_paired_hit_count"] == 0
+
+
+def test_unavailable_exact_shape_evidence_fails_closed() -> None:
+    result = _classify(
+        sweep_hits=[_hit("/World/cube")],
+        exact_shape_hits=None,
+        exact_shape_query_available=False,
+    )
+
+    assert result["passed"] is False
+    assert result["complete"] is False
+    assert "exact_shape_sweep_query_unavailable" in result["failure_reasons"]
+
+
 def test_saturated_sweep_evidence_fails_closed_and_remains_bounded() -> None:
     result = _classify(
         sweep_hits=[

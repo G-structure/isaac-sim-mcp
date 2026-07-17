@@ -133,16 +133,18 @@ def _probe(
     filter_positions: tuple[float, float] = (0.15, 0.15),
     overlap: list[bool] | None = None,
     sweep_hits: list[FakeHit] | None = None,
+    box_sweep_hits: list[FakeHit] | None = None,
     box_overlap_hits: list[FakeHit] | None = None,
     sensor_transforms: list[dict[str, object]] | None = None,
     filter_transforms: list[dict[str, object]] | None = None,
     max_hits_per_pair: int = 16,
 ):
-    shared_sweep_hits = list(sweep_hits or [])
     query = FakeSceneQuery(
         overlap=list(overlap or [False, False]),
-        shape_sweep_hits=list(shared_sweep_hits),
-        box_sweep_hits=list(shared_sweep_hits),
+        shape_sweep_hits=list(sweep_hits or []),
+        box_sweep_hits=list(
+            box_sweep_hits if box_sweep_hits is not None else sweep_hits or []
+        ),
         box_overlap_hits=box_overlap_hits,
     )
     probe = physx_module.PhysxContinuousCollisionProbe(
@@ -201,6 +203,7 @@ def test_backward_relative_sweep_detects_endpoint_clean_crossing() -> None:
 
     assert result["classification"] == "paired_tunneling"
     assert result["tunneling_detected"] is True
+    assert result["tunneling_detected"] is True
     assert result["complete"] is True
     assert query.box_sweeps[0][3:] == (
         (-1.0, -0.0, -0.0),
@@ -225,6 +228,23 @@ def test_current_manifold_contact_accounts_for_sweep_hit() -> None:
 
     assert result["classification"] == "clear"
     assert result["endpoint_evidence"]["current_manifold_contact"] is True
+
+
+def test_rotation_envelope_only_hit_is_not_reported_as_tunneling() -> None:
+    probe, _ = _probe(
+        box_sweep_hits=[FakeHit("/World/cube", "/World/cube/collision", 0.1)],
+        sweep_hits=[],
+    )
+
+    result = probe.sample_pair(
+        label="finger-cube",
+        current_manifold_contact=False,
+    )
+
+    assert result["classification"] == "conservative_envelope_only"
+    assert result["tunneling_detected"] is False
+    assert result["broad_phase_only"] is True
+    assert result["translation_shape_sweep"]["captured_hit_count"] == 0
 
 
 def test_filter_motion_is_removed_from_relative_translation() -> None:
@@ -342,7 +362,11 @@ def test_rotation_only_motion_uses_inflated_overlap_envelope() -> None:
 
     radius = math.sqrt(0.05**2 + 0.02**2 + 0.02**2)
     expected_inflation = 2.0 * radius * math.sin(angle / 2.0)
-    assert result["classification"] == "paired_tunneling"
+    assert result["classification"] == "indeterminate"
+    assert result["tunneling_detected"] is False
+    assert result["broad_phase_only"] is True
+    assert result["complete"] is False
+    assert "exact_shape_sweep_query_unavailable" in result["failure_reasons"]
     assert result["rotation_envelope"] == {
         "method": "body_centered_symmetric_obb_with_chord_inflation",
         "base_half_extents_m": pytest.approx([0.05, 0.02, 0.02]),
