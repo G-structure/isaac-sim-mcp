@@ -1190,6 +1190,63 @@ class IsaacAdapterV5(IsaacAdapterBase):
             "resolution": list(viewport.resolution),
         }
 
+    def _drive_replicator_frame(self, max_pumps: int = 240) -> None:
+        """Render one Replicator frame so camera annotators have data.
+
+        A freshly initialized camera annotator holds no data until the render
+        pipeline produces a frame, and inside Kit the orchestrator only exposes
+        the async stepper. Schedule it and drive the app until it settles.
+        """
+        import asyncio
+
+        try:
+            import omni.kit.app
+            import omni.replicator.core as rep
+
+            app = omni.kit.app.get_app()
+            task = asyncio.ensure_future(rep.orchestrator.step_async())
+        except Exception as exc:
+            self._log_render_warning(f"Could not schedule a Replicator render step: {exc}")
+            return
+        for _ in range(max_pumps):
+            if task.done():
+                break
+            app.update()
+        if task.done() and not task.cancelled():
+            # Surface a failed step instead of silently returning stale data.
+            exc = task.exception()
+            if exc is not None:
+                self._log_render_warning(f"Replicator render step failed: {exc}")
+
+    @staticmethod
+    def _log_render_warning(message: str) -> None:
+        try:
+            import carb
+
+            carb.log_warn(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _has_pixels(image: Any) -> bool:
+        """True when the annotator returned actual pixel data.
+
+        Handles numpy buffers (``size``) and the plain nested sequences that
+        adapters and fakes may return.
+        """
+        if image is None:
+            return False
+        size = getattr(image, "size", None)
+        if size is not None:
+            try:
+                return int(size) > 0
+            except (TypeError, ValueError):
+                return True
+        try:
+            return len(image) > 0
+        except TypeError:
+            return True
+
     def capture_camera_image(self, prim_path: str) -> np.ndarray:
         from isaacsim.sensors.camera import Camera
 
@@ -1203,7 +1260,12 @@ class IsaacAdapterV5(IsaacAdapterBase):
             camera.initialize()
             self._camera_cache[prim_path] = camera
         image = camera.get_rgba()
-        if image is None:
+        if not self._has_pixels(image):
+            # An empty annotator buffer means no frame has been rendered yet, not
+            # that the camera is broken; drive one and re-read before failing.
+            self._drive_replicator_frame()
+            image = camera.get_rgba()
+        if not self._has_pixels(image):
             raise RuntimeError(f"Camera {prim_path} produced no rendered frame")
         return np.asarray(image)
 
